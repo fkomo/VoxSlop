@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 
 namespace VoxSlop.App.Voxels;
 
@@ -276,9 +277,10 @@ public static class WorldGen
             int cx = dimX / 2 + V(3.5f);
             int cz = dimZ / 2;
             int baseY = GroundAt(cx, cz) - V(0.3f);
-            int halfLen = V(3f), thick = V(0.15f), tall = V(2.6f);
+            int halfLen = V(3f), thick = V(0.15f), tall = V(3f);
             shapes.Add(Shape.Box(cx - thick, baseY, cz - halfLen, cx + thick, baseY + tall, cz + halfLen, Materials.Concrete));
-            shapes.Add(Shape.Box(cx - thick - 1, baseY, cz - V(0.5f), cx + thick + 1, baseY + V(2f), cz + V(0.5f), Materials.Air, subtractive: true));
+            // Opening reaches ~2.2 m above ground so the 1.8 m player clears it, with a lintel left above.
+            shapes.Add(Shape.Box(cx - thick - 1, baseY, cz - V(0.5f), cx + thick + 1, baseY + V(2.5f), cz + V(0.5f), Materials.Air, subtractive: true));
         }
 
         // A floating sphere: the cheapest way to see that this is real volume tracing.
@@ -288,45 +290,126 @@ public static class WorldGen
             shapes.Add(Shape.Sphere(cx, GroundAt(cx, cz) + V(1.6f), cz, V(0.9f), Materials.Rust));
         }
 
+        // A large rotated concrete cube near spawn. Its centre sits ~3 m up but the
+        // 5 m body is tilted on three axes, so its lower corners dip well into the
+        // terrain and the voxelised clipping against the ground is clearly visible.
+        {
+            int cx = dimX / 2 + V(6f);
+            int cz = dimZ / 2 + V(5f);
+            var center = new Vector3(cx, GroundAt(cx, cz) + V(3f), cz);
+            var rotation = new Vector3(0.5f, 0.9f, 0.3f);          // fixed tilt, radians
+            shapes.Add(Shape.Cube(center, V(2.5f), rotation, Materials.Concrete)); // 5 m cube
+        }
+
+        // A large tilted concrete beam (unequal extents, so it reads as a slab, not
+        // a cube), on the far side of spawn and leaning into the ground.
+        {
+            int cx = dimX / 2 - V(7f);
+            int cz = dimZ / 2 + V(3f);
+            var center = new Vector3(cx, GroundAt(cx, cz) + V(2.5f), cz);
+            var half = new Vector3(V(4f), V(0.75f), V(1.5f));      // 8 x 1.5 x 3 m slab
+            var rotation = new Vector3(0.15f, 0.6f, 0.85f);        // fixed tilt, radians
+            shapes.Add(Shape.OrientedBox(center, half, rotation, Materials.Concrete));
+        }
+
         return [.. shapes];
     }
 }
 
-/// <summary>An axis-aligned solid stamped over the terrain during generation.</summary>
+/// <summary>
+/// A solid stamped over the terrain during generation. Coordinates are in voxel
+/// units. Boxes may be oriented (rotated) about their centre; spheres are
+/// rotation-invariant. All shapes carry a conservative world-space AABB so brick
+/// classification can reject non-overlapping bricks without a full inside test.
+/// </summary>
 public readonly struct Shape
 {
     private readonly bool _isSphere;
-    private readonly int _minX, _minY, _minZ, _maxX, _maxY, _maxZ;
-    private readonly int _cx, _cy, _cz, _radiusSq;
+    private readonly Vector3 _center;
+    private readonly Vector3 _axisX, _axisY, _axisZ; // orthonormal box axes in world space
+    private readonly Vector3 _half;                  // box half extents
+    private readonly float _radiusSq;                // sphere
+    private readonly int _minX, _minY, _minZ, _maxX, _maxY, _maxZ; // conservative AABB
 
     public byte Material { get; }
     public bool Subtractive { get; }
 
-    private Shape(bool isSphere, int minX, int minY, int minZ, int maxX, int maxY, int maxZ,
-                  int cx, int cy, int cz, int radiusSq, byte material, bool subtractive)
+    private Shape(bool isSphere, Vector3 center, Vector3 axisX, Vector3 axisY, Vector3 axisZ,
+                  Vector3 half, float radiusSq, Vector3 aabbHalf, byte material, bool subtractive)
     {
         _isSphere = isSphere;
-        _minX = minX; _minY = minY; _minZ = minZ;
-        _maxX = maxX; _maxY = maxY; _maxZ = maxZ;
-        _cx = cx; _cy = cy; _cz = cz; _radiusSq = radiusSq;
+        _center = center;
+        _axisX = axisX; _axisY = axisY; _axisZ = axisZ;
+        _half = half; _radiusSq = radiusSq;
+
+        _minX = (int)MathF.Floor(center.X - aabbHalf.X);
+        _minY = (int)MathF.Floor(center.Y - aabbHalf.Y);
+        _minZ = (int)MathF.Floor(center.Z - aabbHalf.Z);
+        _maxX = (int)MathF.Ceiling(center.X + aabbHalf.X);
+        _maxY = (int)MathF.Ceiling(center.Y + aabbHalf.Y);
+        _maxZ = (int)MathF.Ceiling(center.Z + aabbHalf.Z);
+
         Material = material;
         Subtractive = subtractive;
     }
 
+    /// <summary>Axis-aligned box from inclusive voxel bounds (back-compat convenience).</summary>
     public static Shape Box(int minX, int minY, int minZ, int maxX, int maxY, int maxZ,
-                            byte material, bool subtractive = false) =>
-        new(false, minX, minY, minZ, maxX, maxY, maxZ, 0, 0, 0, 0, material, subtractive);
+                            byte material, bool subtractive = false)
+    {
+        var center = new Vector3((minX + maxX) * 0.5f, (minY + maxY) * 0.5f, (minZ + maxZ) * 0.5f);
+        var half = new Vector3((maxX - minX) * 0.5f, (maxY - minY) * 0.5f, (maxZ - minZ) * 0.5f);
+        return OrientedBox(center, half, Vector3.Zero, material, subtractive);
+    }
 
-    public static Shape Sphere(int cx, int cy, int cz, int radius, byte material, bool subtractive = false) =>
-        new(true, cx - radius, cy - radius, cz - radius, cx + radius, cy + radius, cz + radius,
-            cx, cy, cz, radius * radius, material, subtractive);
+    /// <summary>
+    /// Box centred at <paramref name="center"/> (voxels) with the given half extents,
+    /// rotated by Euler angles (radians, applied X then Y then Z). Pass
+    /// <see cref="Vector3.Zero"/> for an axis-aligned box.
+    /// </summary>
+    public static Shape OrientedBox(Vector3 center, Vector3 half, Vector3 eulerRadians,
+                                    byte material, bool subtractive = false)
+    {
+        Matrix4x4 rot = Matrix4x4.CreateRotationX(eulerRadians.X)
+                      * Matrix4x4.CreateRotationY(eulerRadians.Y)
+                      * Matrix4x4.CreateRotationZ(eulerRadians.Z);
+
+        var ax = Vector3.TransformNormal(Vector3.UnitX, rot);
+        var ay = Vector3.TransformNormal(Vector3.UnitY, rot);
+        var az = Vector3.TransformNormal(Vector3.UnitZ, rot);
+
+        // Extent of the oriented box projected onto each world axis.
+        var aabbHalf = new Vector3(
+            half.X * MathF.Abs(ax.X) + half.Y * MathF.Abs(ay.X) + half.Z * MathF.Abs(az.X),
+            half.X * MathF.Abs(ax.Y) + half.Y * MathF.Abs(ay.Y) + half.Z * MathF.Abs(az.Y),
+            half.X * MathF.Abs(ax.Z) + half.Y * MathF.Abs(ay.Z) + half.Z * MathF.Abs(az.Z));
+
+        return new Shape(false, center, ax, ay, az, half, 0f, aabbHalf, material, subtractive);
+    }
+
+    /// <summary>A rotated cube: an oriented box with equal half extents on every axis.</summary>
+    public static Shape Cube(Vector3 center, float halfSize, Vector3 eulerRadians,
+                             byte material, bool subtractive = false) =>
+        OrientedBox(center, new Vector3(halfSize), eulerRadians, material, subtractive);
+
+    public static Shape Sphere(int cx, int cy, int cz, int radius, byte material, bool subtractive = false)
+    {
+        var center = new Vector3(cx, cy, cz);
+        var aabbHalf = new Vector3(radius);
+        return new Shape(true, center, Vector3.UnitX, Vector3.UnitY, Vector3.UnitZ,
+                         Vector3.Zero, radius * (float)radius, aabbHalf, material, subtractive);
+    }
 
     public bool Contains(int x, int y, int z)
     {
         if (x < _minX || x > _maxX || y < _minY || y > _maxY || z < _minZ || z > _maxZ) return false;
-        if (!_isSphere) return true;
-        long dx = x - _cx, dy = y - _cy, dz = z - _cz;
-        return dx * dx + dy * dy + dz * dz <= _radiusSq;
+
+        var d = new Vector3(x, y, z) - _center;
+        if (_isSphere) return d.LengthSquared() <= _radiusSq;
+
+        return MathF.Abs(Vector3.Dot(d, _axisX)) <= _half.X
+            && MathF.Abs(Vector3.Dot(d, _axisY)) <= _half.Y
+            && MathF.Abs(Vector3.Dot(d, _axisZ)) <= _half.Z;
     }
 
     /// <summary>Conservative AABB test — used to decide whether a brick needs full sampling.</summary>

@@ -20,9 +20,11 @@ public static class WorldStore
 
     /// <summary>
     /// Bump when the *meaning* of the stored bytes changes in a way the header
-    /// fields don't already capture (e.g. a new pool encoding). Forces a rebuild.
+    /// fields don't already capture (e.g. a new pool encoding) OR when the world
+    /// generation itself changes (new/edited shapes), since the cache does not hash
+    /// the generation code. Forces a rebuild.
     /// </summary>
-    private const int LayoutVersion = 1;
+    private const int LayoutVersion = 4;
 
     /// <summary>Loads a matching cached world, or generates a fresh one and caches it.</summary>
     public static VoxelWorld LoadOrGenerate(int brickDimX, int brickDimY, int brickDimZ, int seed, string path)

@@ -53,7 +53,7 @@ public sealed class Game : IDisposable
 
     // Point light orbiting the player. It changes to the next palette colour on
     // every completed revolution.
-    private const float PointOrbitSpeed = 1.1f;  // radians per second, ~5.7 s per orbit
+    private const float PointOrbitSpeed = 0.5f;  // radians per second, ~5.7 s per orbit
     private const float PointOrbitRadius = 2.5f; // metres from the player
     private const float PointOrbitHeight = 1.2f; // metres above the player's feet
     private float _pointAngle;
