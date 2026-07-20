@@ -21,6 +21,7 @@ uniform float uTanHalfFov;
 uniform vec3  uSunDir;       // normalised, points toward the sun
 uniform int   uShadows;
 uniform int   uMaxBrickSteps;
+uniform int   uShadowSamples;   // sub-samples per axis across a voxel face (NxN)
 
 const int   B            = 8;          // voxels per brick edge
 const uint  UNIFORM_FLAG = 0x80000000u;
@@ -266,6 +267,44 @@ vec3 skyColor(vec3 rd)
     return sky + vec3(1.0, 0.92, 0.75) * sun;
 }
 
+// Fraction of the lit voxel FACE that can see the sun, returned as a light factor
+// in [0,1]. The sample points are derived from the voxel coordinate and its face
+// normal -- NOT from the per-pixel hit point -- so every pixel covering the face
+// evaluates the same set of rays and gets an identical result. That is what makes
+// the shadow resolution one-per-voxel instead of one-per-pixel, while sub-sampling
+// across the face still yields a soft coverage ratio at the voxel's own edges.
+float voxelFaceLight(ivec3 voxel, vec3 n)
+{
+    // Outer face plane: voxel centre pushed half a voxel along the normal.
+    vec3 faceCentre = vec3(voxel) + 0.5 + n * 0.5;
+
+    // Orthonormal tangent frame spanning the face. n is always axis-aligned here.
+    vec3 t1 = (abs(n.y) > 0.5) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t2 = normalize(cross(n, t1));
+    t1 = cross(t2, n);
+
+    int s = clamp(uShadowSamples, 1, 8);
+    float inv = 1.0 / float(s);
+    float lit = 0.0;
+
+    for (int i = 0; i < s; i++)
+    for (int j = 0; j < s; j++)
+    {
+        // Centre of each sub-cell, in [-0.5, 0.5] across the face. A small inset
+        // (0.5) keeps samples off the shared edges with neighbouring voxels.
+        float u = (float(i) + 0.5) * inv - 0.5;
+        float v = (float(j) + 0.5) * inv - 0.5;
+
+        // Start just off the face so the ray cannot immediately re-hit this voxel.
+        vec3 origin = faceCentre + t1 * u + t2 * v + n * 1e-2;
+
+        Hit blocker;
+        if (!trace(origin, uSunDir, SHADOW_RANGE, blocker)) lit += 1.0;
+    }
+
+    return lit * (inv * inv);
+}
+
 void main()
 {
     vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;
@@ -283,14 +322,10 @@ void main()
         vec3 albedo = surfaceColor(hit.material, hit.voxel, hit.normal);
 
         float ndl = max(dot(hit.normal, uSunDir), 0.0);
+        // One shadow value for the whole voxel face, quantised to a coverage ratio.
         float shadow = 1.0;
         if (uShadows != 0 && ndl > 0.0)
-        {
-            // Step off the surface by half a voxel so the ray doesn't re-hit its origin.
-            vec3 origin = uCamPos + rd * hit.t + hit.normal * 0.5;
-            Hit blocker;
-            if (trace(origin, uSunDir, SHADOW_RANGE, blocker)) shadow = 0.0;
-        }
+            shadow = voxelFaceLight(hit.voxel, hit.normal);
 
         // Sky-dominant ambient plus a weak bounce off the ground.
         vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), hit.normal.y * -0.5 + 0.5);

@@ -36,6 +36,12 @@ public sealed class RaymarchRenderer : IDisposable
 
     public Vector3 SunDirection { get; set; } = Vector3.Normalize(new Vector3(0.45f, 0.72f, 0.28f));
 
+    /// <summary>
+    /// Shadow sub-samples per axis across each voxel face (NxN). Higher gives a
+    /// smoother coverage ratio at voxel edges but costs N*N shadow rays per pixel.
+    /// </summary>
+    public int ShadowSamples { get; set; } = 2;
+
     public RaymarchRenderer(GL gl, VoxelWorld world, string shaderDirectory)
     {
         _gl = gl;
@@ -105,6 +111,7 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Set("uSunDir", SunDirection);
         _shader.Set("uShadows", Shadows ? 1 : 0);
         _shader.Set("uMaxBrickSteps", MaxBrickSteps);
+        _shader.Set("uShadowSamples", ShadowSamples);
 
         _gl.BindVertexArray(_vao);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
