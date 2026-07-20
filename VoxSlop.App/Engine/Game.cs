@@ -51,6 +51,24 @@ public sealed class Game : IDisposable
     private const float ShadowEpochStep = 0.008f; // radians of sun travel per generation
     private float _epochAngle = 0.6f;
 
+    // Point light orbiting the player. It changes to the next palette colour on
+    // every completed revolution.
+    private const float PointOrbitSpeed = 1.1f;  // radians per second, ~5.7 s per orbit
+    private const float PointOrbitRadius = 2.5f; // metres from the player
+    private const float PointOrbitHeight = 1.2f; // metres above the player's feet
+    private float _pointAngle;
+    private int _pointColorIndex;
+    private static readonly Vector3[] PointColors =
+    [
+        //new(1.0f, 0.25f, 0.20f), // red
+        new(1.0f, 0.55f, 0.15f), // orange
+        //new(1.0f, 0.95f, 0.30f), // yellow
+        //new(0.30f, 1.0f, 0.35f), // green
+        //new(0.25f, 0.8f, 1.0f),  // cyan
+        //new(0.45f, 0.4f, 1.0f),  // indigo
+        //new(1.0f, 0.4f, 0.95f),  // magenta
+    ];
+
     public Game()
     {
         var options = WindowOptions.Default with
@@ -110,6 +128,7 @@ public sealed class Game : IDisposable
         Console.WriteLine("  L            toggle sun shadows");
         Console.WriteLine("  P            pause / resume the sun");
         Console.WriteLine("  C            toggle per-voxel-face shadow cache");
+        Console.WriteLine("  G            toggle the orbiting point light");
         Console.WriteLine("  R            reload shaders from disk");
         Console.WriteLine("  Esc          release / recapture the cursor (click to recapture)");
         Console.WriteLine();
@@ -135,6 +154,9 @@ public sealed class Game : IDisposable
                 _renderer.ShadowCache = !_renderer.ShadowCache;
                 // Force a rebuild of every face next frame so the toggle is clean.
                 _renderer.ShadowEpoch++;
+                break;
+            case Key.G:
+                _renderer.PointLightEnabled = !_renderer.PointLightEnabled;
                 break;
             case Key.R:
                 _renderer.TryReloadShaders();
@@ -170,7 +192,23 @@ public sealed class Game : IDisposable
         if (_mouseCaptured) _player.Update(_keyboard, (float)deltaSeconds);
 
         UpdateSun(deltaSeconds);
+        UpdatePointLight(deltaSeconds);
         UpdateTitle(deltaSeconds);
+    }
+
+    private void UpdatePointLight(double deltaSeconds)
+    {
+        float previous = _pointAngle;
+        _pointAngle += (float)deltaSeconds * PointOrbitSpeed;
+
+        // Advance the colour whenever the orbit passes a full-revolution boundary.
+        if (MathF.Floor(_pointAngle / MathF.Tau) != MathF.Floor(previous / MathF.Tau))
+            _pointColorIndex = (_pointColorIndex + 1) % PointColors.Length;
+
+        var centre = _player.FeetPosition + new Vector3(0f, PointOrbitHeight, 0f);
+        _renderer.PointLightPosition = centre + new Vector3(
+            MathF.Cos(_pointAngle) * PointOrbitRadius, 0f, MathF.Sin(_pointAngle) * PointOrbitRadius);
+        _renderer.PointLightColor = PointColors[_pointColorIndex];
     }
 
     private void UpdateSun(double deltaSeconds)

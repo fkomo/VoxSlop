@@ -30,10 +30,18 @@ uniform int   uShadowCache;     // 0 = recompute per pixel, 1 = use the face cac
 uniform uint  uShadowEpoch;     // cache generation; bumped when the sun moves enough
 uniform uint  uShadowCacheSize; // number of slots in shadowCache
 
+// Orbiting point light.
+uniform int   uPointOn;         // 0 = disabled
+uniform vec3  uPointPos;        // position in VOXEL units
+uniform vec3  uPointColor;      // linear RGB
+uniform float uPointStrength;   // intensity; also gates whether a surface is lit at all
+
 const int   B            = 8;          // voxels per brick edge
 const uint  UNIFORM_FLAG = 0x80000000u;
 const float FOG_DENSITY  = 0.00006;    // per voxel of distance; light enough to see far terrain
 const float SHADOW_RANGE = 2500.0;     // voxels; long enough for terrain to shade itself
+const float POINT_FALLOFF = 0.0030;    // inverse-square attenuation scale (per voxel^2)
+const float POINT_MIN     = 0.03;      // below this, a surface receives no meaningful light
 
 uint brickAt(ivec3 bc)
 {
@@ -356,6 +364,84 @@ float faceShadow(ivec3 voxel, vec3 n)
     return light;
 }
 
+// Fraction of a voxel face that can see a point light at lightPos (voxel units).
+// Same face-quantised sampling as the sun, but each ray is cast toward the light
+// and only counts occluders BETWEEN the face and the light, not past it.
+float pointFaceVisible(ivec3 voxel, vec3 n, vec3 lightPos)
+{
+    vec3 faceCentre = vec3(voxel) + 0.5 + n * 0.5;
+
+    vec3 t1 = (abs(n.y) > 0.5) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t2 = normalize(cross(n, t1));
+    t1 = cross(t2, n);
+
+    int s = clamp(uShadowSamples, 1, 8);
+    float inv = 1.0 / float(s);
+    float lit = 0.0;
+
+    for (int i = 0; i < s; i++)
+    for (int j = 0; j < s; j++)
+    {
+        float u = (float(i) + 0.5) * inv - 0.5;
+        float v = (float(j) + 0.5) * inv - 0.5;
+
+        vec3 origin = faceCentre + t1 * u + t2 * v + n * 1e-2;
+        vec3 d = lightPos - origin;
+        float dist = length(d);
+        vec3 dir = d / dist;
+
+        Hit blocker;
+        // Stop short of the light so we don't count geometry at or behind it.
+        if (!trace(origin, dir, dist - 0.5, blocker)) lit += 1.0;
+    }
+
+    return lit * (inv * inv);
+}
+
+// Colored contribution of the orbiting point light on a voxel face. Strength
+// drives inverse-square attenuation AND gates the work: if strength * attenuation
+// * NdotL is below POINT_MIN the surface receives no meaningful light, so we skip
+// the shadow test entirely (both a correctness statement and the perf guard that
+// keeps the lit region local to the light).
+vec3 pointLight(ivec3 voxel, vec3 n)
+{
+    if (uPointOn == 0) return vec3(0.0);
+
+    vec3 faceCentre = vec3(voxel) + 0.5 + n * 0.5;
+    vec3 d = uPointPos - faceCentre;
+    float dist = length(d);
+    float ndl = max(dot(n, d / dist), 0.0);
+
+    float atten = 1.0 / (1.0 + dist * dist * POINT_FALLOFF);
+    float contrib = uPointStrength * atten * ndl;
+    if (contrib < POINT_MIN) return vec3(0.0);
+
+    return uPointColor * contrib * pointFaceVisible(voxel, n, uPointPos);
+}
+
+// Nearest intersection of a unit-direction ray with an axis-aligned box, plus the
+// entry face normal. Returns false on a miss or if the box is fully behind ro.
+bool rayBox(vec3 ro, vec3 rd, vec3 lo, vec3 hi, out float t, out vec3 n)
+{
+    vec3 inv = 1.0 / rd;
+    vec3 a = (lo - ro) * inv;
+    vec3 b = (hi - ro) * inv;
+    vec3 tmin = min(a, b);
+    vec3 tmax = max(a, b);
+
+    float tN = max(max(tmin.x, tmin.y), tmin.z);
+    float tF = min(min(tmax.x, tmax.y), tmax.z);
+    if (tF < max(tN, 0.0)) return false;
+
+    t = (tN >= 0.0) ? tN : tF;   // use the far face if the origin is inside
+    if (t < 0.0) return false;
+
+    // The slab that produced tN is the entry face.
+    n = vec3(lessThanEqual(tmin.yzx, tmin.xyz)) * vec3(lessThanEqual(tmin.zxy, tmin.xyz));
+    n *= -sign(rd);
+    return true;
+}
+
 void main()
 {
     vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;
@@ -368,7 +454,10 @@ void main()
     vec3 color;
     Hit hit;
 
-    if (trace(uCamPos, rd, 1e6, hit))
+    bool hitWorld = trace(uCamPos, rd, 1e6, hit);
+    float worldT = hitWorld ? hit.t : 1e30;
+
+    if (hitWorld)
     {
         vec3 albedo = surfaceColor(hit.material, hit.voxel, hit.normal);
 
@@ -382,12 +471,30 @@ void main()
         vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), hit.normal.y * -0.5 + 0.5);
         vec3 lit = albedo * (ambient + vec3(1.0, 0.95, 0.85) * ndl * shadow * 1.15);
 
+        // Add the orbiting point light on top of the sun/ambient.
+        lit += albedo * pointLight(hit.voxel, hit.normal);
+
         float fog = 1.0 - exp(-hit.t * FOG_DENSITY);
         color = mix(lit, skyColor(rd), fog);
     }
     else
     {
         color = skyColor(rd);
+    }
+
+    // Draw the light source as the single emissive voxel it occupies, when it is
+    // nearer than the world surface (so terrain in front still occludes it). The
+    // source is not lit or shadowed by anything.
+    vec3 boxLo = floor(uPointPos);
+    float boxT;
+    vec3 boxN;
+    if (uPointOn != 0 && rayBox(uCamPos, rd, boxLo, boxLo + 1.0, boxT, boxN) && boxT < worldT)
+    {
+        // Slight per-face brightness so the cube reads as a cube, not a flat blob.
+        vec3 emissive = uPointColor * (1.15 + 0.35 * (boxN.y * 0.5 + 0.5));
+
+        float fog = 1.0 - exp(-boxT * FOG_DENSITY);
+        color = mix(emissive, skyColor(rd), fog);
     }
 
     // Crosshair, drawn straight into the frame -- no UI pass in this demo.

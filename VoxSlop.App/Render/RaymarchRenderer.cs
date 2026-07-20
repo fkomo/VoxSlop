@@ -59,6 +59,21 @@ public sealed class RaymarchRenderer : IDisposable
     /// </summary>
     public uint ShadowEpoch { get; set; } = 1;
 
+    // --- Orbiting point light ---
+    public bool PointLightEnabled { get; set; } = true;
+
+    /// <summary>Point light position, in metres (converted to voxel units on upload).</summary>
+    public Vector3 PointLightPosition { get; set; }
+
+    public Vector3 PointLightColor { get; set; } = new(1f, 0.3f, 0.2f);
+
+    /// <summary>
+    /// Intensity of the point light. Also the reach control: a surface only counts
+    /// as lit (and only casts a shadow for this light) where strength * attenuation
+    /// * NdotL clears the shader's threshold, so raising it enlarges the lit area.
+    /// </summary>
+    public float PointLightStrength { get; set; } = 6f;
+
     public RaymarchRenderer(GL gl, VoxelWorld world, string shaderDirectory)
     {
         _gl = gl;
@@ -136,6 +151,10 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Set("uShadowCache", ShadowCache ? 1 : 0);
         _shader.Set("uShadowEpoch", ShadowEpoch);
         _shader.Set("uShadowCacheSize", ShadowCacheSlots);
+        _shader.Set("uPointOn", PointLightEnabled ? 1 : 0);
+        _shader.Set("uPointPos", PointLightPosition / VoxelWorld.VoxelSize);
+        _shader.Set("uPointColor", PointLightColor);
+        _shader.Set("uPointStrength", PointLightStrength);
 
         _gl.BindVertexArray(_vao);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
