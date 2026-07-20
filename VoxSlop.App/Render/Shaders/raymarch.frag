@@ -11,6 +11,10 @@ out vec4 FragColor;
 layout(std430, binding = 0) readonly buffer BrickIndex { uint bricks[]; };
 layout(std430, binding = 1) readonly buffer VoxelPool  { uint voxels[]; };
 
+// Per-voxel-face shadow cache. One slot holds (keyLo, keyHi, epoch, lightBits).
+// coherent so writes from earlier draws are visible to later ones after a barrier.
+layout(std430, binding = 2) coherent buffer ShadowCache { uvec4 shadowCache[]; };
+
 uniform ivec3 uBrickDims;    // grid size in bricks
 uniform vec3  uCamPos;       // eye position in VOXEL units
 uniform vec3  uCamRight;
@@ -22,6 +26,9 @@ uniform vec3  uSunDir;       // normalised, points toward the sun
 uniform int   uShadows;
 uniform int   uMaxBrickSteps;
 uniform int   uShadowSamples;   // sub-samples per axis across a voxel face (NxN)
+uniform int   uShadowCache;     // 0 = recompute per pixel, 1 = use the face cache
+uniform uint  uShadowEpoch;     // cache generation; bumped when the sun moves enough
+uniform uint  uShadowCacheSize; // number of slots in shadowCache
 
 const int   B            = 8;          // voxels per brick edge
 const uint  UNIFORM_FLAG = 0x80000000u;
@@ -305,6 +312,50 @@ float voxelFaceLight(ivec3 voxel, vec3 n)
     return lit * (inv * inv);
 }
 
+// Packs a voxel face into a 64-bit key. Voxel coords reach ~8192 (13 bits) in X/Z
+// and a few hundred (10 bits) in Y; the face index is 0..5 (3 bits).
+uvec2 faceKey(ivec3 voxel, int faceIndex)
+{
+    uint lo = uint(voxel.x) | (uint(voxel.z) << 13);            // 13 + 13 bits
+    uint hi = uint(voxel.y) | (uint(faceIndex) << 12);          // 12 + 3 bits
+    return uvec2(lo, hi);
+}
+
+uint hashKey(uvec2 k)
+{
+    uint h = k.x * 2654435761u ^ k.y * 2246822519u;
+    h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+    return h;
+}
+
+int faceIndexOf(vec3 n)
+{
+    if (n.x > 0.5) return 0; if (n.x < -0.5) return 1;
+    if (n.y > 0.5) return 2; if (n.y < -0.5) return 3;
+    return (n.z > 0.5) ? 4 : 5;
+}
+
+// Voxel-face shadow, computed once per (face, sun epoch) and reused across every
+// pixel that covers the face. The cached value is a deterministic function of the
+// face and sun, so a race between two pixels computing the same slot is harmless:
+// both write the identical number. A slot mismatch (empty, stale epoch, or a hash
+// collision with a different face) simply recomputes -- never a wrong value.
+float faceShadow(ivec3 voxel, vec3 n)
+{
+    if (uShadowCache == 0) return voxelFaceLight(voxel, n);
+
+    uvec2 key = faceKey(voxel, faceIndexOf(n));
+    uint slot = hashKey(key) % uShadowCacheSize;
+
+    uvec4 e = shadowCache[slot];
+    if (e.x == key.x && e.y == key.y && e.z == uShadowEpoch)
+        return uintBitsToFloat(e.w);
+
+    float light = voxelFaceLight(voxel, n);
+    shadowCache[slot] = uvec4(key.x, key.y, uShadowEpoch, floatBitsToUint(light));
+    return light;
+}
+
 void main()
 {
     vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;
@@ -325,7 +376,7 @@ void main()
         // One shadow value for the whole voxel face, quantised to a coverage ratio.
         float shadow = 1.0;
         if (uShadows != 0 && ndl > 0.0)
-            shadow = voxelFaceLight(hit.voxel, hit.normal);
+            shadow = faceShadow(hit.voxel, hit.normal);
 
         // Sky-dominant ambient plus a weak bounce off the ground.
         vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), hit.normal.y * -0.5 + 0.5);

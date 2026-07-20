@@ -86,6 +86,12 @@ public sealed class Shader : IDisposable
         if (l >= 0) _gl.Uniform1(l, value);
     }
 
+    public void Set(string name, uint value)
+    {
+        int l = Location(name);
+        if (l >= 0) _gl.Uniform1(l, value);
+    }
+
     public void Set(string name, float x, float y)
     {
         int l = Location(name);

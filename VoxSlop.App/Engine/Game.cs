@@ -44,6 +44,13 @@ public sealed class Game : IDisposable
     private float _sunAngle = 0.6f;       // start mid-morning
     private bool _sunPaused;
 
+    // Shadow-cache generations. Bumping the epoch invalidates every cached voxel
+    // face; we do it only once the sun has travelled a small step, so a paused or
+    // slow-moving sun keeps reusing cached shadows across frames. The visible cost
+    // is that shadows update in ~ShadowEpochStep increments rather than continuously.
+    private const float ShadowEpochStep = 0.008f; // radians of sun travel per generation
+    private float _epochAngle = 0.6f;
+
     public Game()
     {
         var options = WindowOptions.Default with
@@ -102,6 +109,7 @@ public sealed class Game : IDisposable
         Console.WriteLine("  F            toggle walk / noclip");
         Console.WriteLine("  L            toggle sun shadows");
         Console.WriteLine("  P            pause / resume the sun");
+        Console.WriteLine("  C            toggle per-voxel-face shadow cache");
         Console.WriteLine("  R            reload shaders from disk");
         Console.WriteLine("  Esc          release / recapture the cursor (click to recapture)");
         Console.WriteLine();
@@ -122,6 +130,11 @@ public sealed class Game : IDisposable
                 break;
             case Key.P:
                 _sunPaused = !_sunPaused;
+                break;
+            case Key.C:
+                _renderer.ShadowCache = !_renderer.ShadowCache;
+                // Force a rebuild of every face next frame so the toggle is clean.
+                _renderer.ShadowEpoch++;
                 break;
             case Key.R:
                 _renderer.TryReloadShaders();
@@ -170,6 +183,13 @@ public sealed class Game : IDisposable
         // normalise here.
         _renderer.SunDirection = Vector3.Normalize(
             new Vector3(MathF.Cos(_sunAngle), MathF.Sin(_sunAngle), 0.30f));
+
+        // Advance the shadow-cache generation once the sun has moved a full step.
+        if (MathF.Abs(_sunAngle - _epochAngle) >= ShadowEpochStep)
+        {
+            _renderer.ShadowEpoch++;
+            _epochAngle = _sunAngle;
+        }
     }
 
     private void UpdateTitle(double deltaSeconds)
@@ -182,7 +202,8 @@ public sealed class Game : IDisposable
         _window.Title =
             $"VoxSlop  |  {_framesSinceTitle / _titleTimer:0} fps  |  " +
             $"{p.X:0.00}, {p.Y:0.00}, {p.Z:0.00} m  |  " +
-            $"{(_player.Flying ? "noclip" : "walk")}  |  shadows {(_renderer.Shadows ? "on" : "off")}";
+            $"{(_player.Flying ? "noclip" : "walk")}  |  shadows {(_renderer.Shadows ? "on" : "off")}" +
+            $"  |  cache {(_renderer.ShadowCache ? "on" : "off")}";
 
         _titleTimer = 0;
         _framesSinceTitle = 0;

@@ -14,6 +14,10 @@ public sealed class RaymarchRenderer : IDisposable
 {
     private const uint BrickIndexBinding = 0;
     private const uint VoxelPoolBinding = 1;
+    private const uint ShadowCacheBinding = 2;
+
+    /// <summary>Number of slots in the voxel-face shadow cache (16 bytes each = 32 MB).</summary>
+    public const uint ShadowCacheSlots = 1u << 21;
 
     private readonly GL _gl;
     private readonly VoxelWorld _world;
@@ -22,6 +26,7 @@ public sealed class RaymarchRenderer : IDisposable
     private readonly uint _vao;
     private readonly uint _brickIndexBuffer;
     private readonly uint _voxelPoolBuffer;
+    private readonly uint _shadowCacheBuffer;
 
     private Shader _shader;
 
@@ -42,6 +47,18 @@ public sealed class RaymarchRenderer : IDisposable
     /// </summary>
     public int ShadowSamples { get; set; } = 2;
 
+    /// <summary>
+    /// When true, each voxel face's shadow is computed once per <see cref="ShadowEpoch"/>
+    /// and reused across every pixel that covers it, instead of recomputing per pixel.
+    /// </summary>
+    public bool ShadowCache { get; set; } = true;
+
+    /// <summary>
+    /// Cache generation. Bump it whenever the shadow result would change (the sun
+    /// moved, or the sample count changed) to invalidate stale cached faces.
+    /// </summary>
+    public uint ShadowEpoch { get; set; } = 1;
+
     public RaymarchRenderer(GL gl, VoxelWorld world, string shaderDirectory)
     {
         _gl = gl;
@@ -57,9 +74,13 @@ public sealed class RaymarchRenderer : IDisposable
         _voxelPoolBuffer = UploadStorage(VoxelPoolBinding, world.Pool.Length > 0
             ? world.Pool
             : new uint[VoxelWorld.UintsPerBrick]); // never upload a zero-sized buffer
+
+        // Zero-initialised: slots must not spuriously match epoch 1 with garbage data.
+        _shadowCacheBuffer = UploadStorage(ShadowCacheBinding, new uint[ShadowCacheSlots * 4],
+            BufferUsageARB.DynamicCopy);
     }
 
-    private uint UploadStorage(uint binding, uint[] data)
+    private uint UploadStorage(uint binding, uint[] data, BufferUsageARB usage = BufferUsageARB.StaticDraw)
     {
         uint buffer = _gl.GenBuffer();
         _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, buffer);
@@ -67,7 +88,7 @@ public sealed class RaymarchRenderer : IDisposable
             BufferTargetARB.ShaderStorageBuffer,
             (nuint)(data.Length * sizeof(uint)),
             new ReadOnlySpan<uint>(data),
-            BufferUsageARB.StaticDraw);
+            usage);
         _gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, binding, buffer);
         return buffer;
     }
@@ -112,9 +133,15 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Set("uShadows", Shadows ? 1 : 0);
         _shader.Set("uMaxBrickSteps", MaxBrickSteps);
         _shader.Set("uShadowSamples", ShadowSamples);
+        _shader.Set("uShadowCache", ShadowCache ? 1 : 0);
+        _shader.Set("uShadowEpoch", ShadowEpoch);
+        _shader.Set("uShadowCacheSize", ShadowCacheSlots);
 
         _gl.BindVertexArray(_vao);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+
+        // Make this frame's cache writes visible to next frame's cache reads.
+        _gl.MemoryBarrier(MemoryBarrierMask.ShaderStorageBarrierBit);
     }
 
     public void Dispose()
@@ -122,6 +149,7 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Dispose();
         _gl.DeleteBuffer(_brickIndexBuffer);
         _gl.DeleteBuffer(_voxelPoolBuffer);
+        _gl.DeleteBuffer(_shadowCacheBuffer);
         _gl.DeleteVertexArray(_vao);
     }
 }
