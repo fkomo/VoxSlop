@@ -36,6 +36,14 @@ public sealed class Game : IDisposable
     private double _titleTimer;
     private int _framesSinceTitle;
 
+    // Sun orbit. The sun sweeps a vertical east-west arc (rising +X, overhead +Y,
+    // setting -X, then below the horizon for "night"), tilted slightly so it never
+    // passes exactly overhead. Advances even when the cursor is released, and can
+    // be paused with P.
+    private const float SunSpeed = 0.15f; // radians per second, ~42 s per full circle
+    private float _sunAngle = 0.6f;       // start mid-morning
+    private bool _sunPaused;
+
     public Game()
     {
         var options = WindowOptions.Default with
@@ -93,6 +101,7 @@ public sealed class Game : IDisposable
         Console.WriteLine("  Space        jump / fly up          Ctrl  fly down");
         Console.WriteLine("  F            toggle walk / noclip");
         Console.WriteLine("  L            toggle sun shadows");
+        Console.WriteLine("  P            pause / resume the sun");
         Console.WriteLine("  R            reload shaders from disk");
         Console.WriteLine("  Esc          release / recapture the cursor (click to recapture)");
         Console.WriteLine();
@@ -110,6 +119,9 @@ public sealed class Game : IDisposable
                 break;
             case Key.L:
                 _renderer.Shadows = !_renderer.Shadows;
+                break;
+            case Key.P:
+                _sunPaused = !_sunPaused;
                 break;
             case Key.R:
                 _renderer.TryReloadShaders();
@@ -144,7 +156,20 @@ public sealed class Game : IDisposable
 
         if (_mouseCaptured) _player.Update(_keyboard, (float)deltaSeconds);
 
+        UpdateSun(deltaSeconds);
         UpdateTitle(deltaSeconds);
+    }
+
+    private void UpdateSun(double deltaSeconds)
+    {
+        if (!_sunPaused) _sunAngle += (float)deltaSeconds * SunSpeed;
+
+        // Circle in the X-Y plane with a small constant Z lean, so the arc is
+        // offset from straight overhead. The shader treats uSunDir as unit length
+        // (it's a shadow-ray direction and SHADOW_RANGE assumes |dir| == 1), so
+        // normalise here.
+        _renderer.SunDirection = Vector3.Normalize(
+            new Vector3(MathF.Cos(_sunAngle), MathF.Sin(_sunAngle), 0.30f));
     }
 
     private void UpdateTitle(double deltaSeconds)

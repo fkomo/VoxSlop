@@ -73,7 +73,7 @@ float valueNoise(vec3 p)
 // Grass gets three scales of variation stacked on top of each other: broad
 // patches of dry-vs-lush, smaller tufts inside those, and a per-voxel speckle.
 // Without the coarse layers a purely per-voxel hash just reads as TV static.
-vec3 grassColor(ivec3 v, vec3 n)
+vec3 grassColor(ivec3 v)
 {
     // Note: "patch" is a reserved word in GLSL 4.x (tessellation), hence "meadow".
     float meadow = valueNoise(vec3(v) / 130.0);   // ~6.5 m at 5 cm voxels
@@ -92,16 +92,12 @@ vec3 grassColor(ivec3 v, vec3 n)
     // separate from each other at close range.
     c *= 0.86 + 0.28 * hashCell(v + ivec3(17, 0, 41));
 
-    // Grass exposed on a vertical face is really a cut edge -- drift it toward
-    // soil so cliffs don't look like they are carpeted.
-    c = mix(vec3(0.34, 0.27, 0.15), c, 0.45 + 0.55 * clamp(n.y, 0.0, 1.0));
-
     return c;
 }
 
 vec3 surfaceColor(uint m, ivec3 v, vec3 n)
 {
-    if (m == 1u) return grassColor(v, n);
+    if (m == 1u) return grassColor(v);
 
     vec3 base;
     if      (m == 2u) base = vec3(0.42, 0.30, 0.18);   // dirt
