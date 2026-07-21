@@ -11,13 +11,12 @@ namespace VoxSlop.App.Engine;
 /// <summary>Owns the window, the world and the render loop.</summary>
 public sealed class Game : IDisposable
 {
-    // 640 x 320 x 640 bricks of 8 voxels at 2 cm = 5120 x 2560 x 5120 voxels,
+    // 256 x 128 x 256 bricks of 8 voxels at 5 cm = 2048 x 1024 x 2048 voxels,
     // i.e. a ~102 x 51 x 102 m world. The brick index is dense over the whole
-    // volume at 4 bytes/brick, so the tall (mostly-empty) headroom costs VRAM: the
-    // index alone is ~500 MB here. The surface pool is unaffected by height.
-    private const int BrickDimX = 640;
-    private const int BrickDimY = 320;
-    private const int BrickDimZ = 640;
+    // volume at 4 bytes/brick (~33 MB here); the surface pool grows with area.
+    private const int BrickDimX = 256;
+    private const int BrickDimY = 128;
+    private const int BrickDimZ = 256;
     private const int Seed = 1337;
 
     // Scatter single +1 voxels on the surface for a rougher, tuftier grass look.

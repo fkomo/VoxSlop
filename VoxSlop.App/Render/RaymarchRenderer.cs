@@ -70,10 +70,10 @@ public sealed class RaymarchRenderer : IDisposable
 
     /// <summary>
     /// Cap on brick-level DDA steps; the practical view distance limiter. A ray can
-    /// cross up to dimX+dimY+dimZ bricks (~1600 at 640x320x640) before leaving the
+    /// cross up to dimX+dimY+dimZ bricks (~640 at 256x128x256) before leaving the
     /// grid, so anything less clips distant terrain away mid-ray.
     /// </summary>
-    public int MaxBrickSteps { get; set; } = 1700;
+    public int MaxBrickSteps { get; set; } = 700;
 
     public Vector3 SunDirection { get; set; } = Vector3.Normalize(new Vector3(0.45f, 0.72f, 0.28f));
 
