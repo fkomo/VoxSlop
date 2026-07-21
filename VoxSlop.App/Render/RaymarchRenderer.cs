@@ -68,6 +68,15 @@ public sealed class RaymarchRenderer : IDisposable
 
     public bool AmbientOcclusion { get; set; } = true;
 
+    /// <summary>Round voxels into smooth blobs (near field) instead of hard cubes.</summary>
+    public bool BlobVoxels { get; set; } = false;
+
+    /// <summary>Render each voxel as a sphere/bead (near field) instead of a cube.</summary>
+    public bool SphereVoxels { get; set; } = false;
+
+    /// <summary>Quantise the final image to a fixed retro palette with ordered dithering.</summary>
+    public bool RetroPalette { get; set; } = true;
+
     /// <summary>
     /// Cap on brick-level DDA steps; the practical view distance limiter. A ray can
     /// cross up to dimX+dimY+dimZ bricks (~640 at 256x128x256) before leaving the
@@ -285,62 +294,65 @@ public sealed class RaymarchRenderer : IDisposable
     public void Render(Camera camera, int width, int height)
     {
         _gl.BindVertexArray(_vao);
-
-        if (!TaaEnabled)
-        {
-            _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
-            DrawScene(camera, width, height, Vector2.Zero);
-            StorePrevCamera(camera);
-            return;
-        }
-
         EnsureTargets(width, height);
-        Vector2 jitter = NextJitter(width, height);
-        int prev = _historyCur;
-        int cur = 1 - _historyCur;
 
-        // Pass 1: raymarch the jittered frame into the scene texture.
+        // Jitter only when TAA is accumulating.
+        Vector2 jitter = TaaEnabled ? NextJitter(width, height) : Vector2.Zero;
+
+        // Pass 1: raymarch the scene into the offscreen texture.
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, _fbo);
         _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
             TextureTarget.Texture2D, _sceneTex, 0);
         DrawScene(camera, width, height, jitter);
 
-        // Pass 2: blend into history (reprojected + clamped) -> historyTex[cur].
-        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
-            TextureTarget.Texture2D, _historyTex[cur], 0);
-        _gl.Viewport(0, 0, (uint)width, (uint)height);
-        _taaShader.Use();
-        BindTexture(0, _sceneTex);
-        BindTexture(1, _historyTex[prev]);
-        _taaShader.Set("uScene", 0);
-        _taaShader.Set("uHistory", 1);
-        _taaShader.Set("uResolution", width, height);
-        _taaShader.Set("uJitter", jitter.X, jitter.Y);
-        _taaShader.Set("uTanHalfFov", camera.TanHalfFov);
-        _taaShader.Set("uCamPos", camera.Position / VoxelWorld.VoxelSize);
-        _taaShader.Set("uCamRight", camera.Right);
-        _taaShader.Set("uCamUp", camera.Up);
-        _taaShader.Set("uCamForward", camera.Forward);
-        _taaShader.Set("uPrevPos", _prevPos);
-        _taaShader.Set("uPrevRight", _prevRight);
-        _taaShader.Set("uPrevUp", _prevUp);
-        _taaShader.Set("uPrevForward", _prevForward);
-        _taaShader.Set("uPrevTanHalfFov", _prevTanHalfFov);
-        _taaShader.Set("uReset", _historyValid ? 0 : 1);
-        _taaShader.Set("uBlend", 0.1f);
-        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        uint presentTex = _sceneTex;
 
-        // Pass 3: present history[cur] to the screen with the crosshair on top.
+        if (TaaEnabled)
+        {
+            int prev = _historyCur;
+            int cur = 1 - _historyCur;
+
+            // Pass 2: blend into history (reprojected + clamped) -> historyTex[cur].
+            _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+                TextureTarget.Texture2D, _historyTex[cur], 0);
+            _gl.Viewport(0, 0, (uint)width, (uint)height);
+            _taaShader.Use();
+            BindTexture(0, _sceneTex);
+            BindTexture(1, _historyTex[prev]);
+            _taaShader.Set("uScene", 0);
+            _taaShader.Set("uHistory", 1);
+            _taaShader.Set("uResolution", width, height);
+            _taaShader.Set("uJitter", jitter.X, jitter.Y);
+            _taaShader.Set("uTanHalfFov", camera.TanHalfFov);
+            _taaShader.Set("uCamPos", camera.Position / VoxelWorld.VoxelSize);
+            _taaShader.Set("uCamRight", camera.Right);
+            _taaShader.Set("uCamUp", camera.Up);
+            _taaShader.Set("uCamForward", camera.Forward);
+            _taaShader.Set("uPrevPos", _prevPos);
+            _taaShader.Set("uPrevRight", _prevRight);
+            _taaShader.Set("uPrevUp", _prevUp);
+            _taaShader.Set("uPrevForward", _prevForward);
+            _taaShader.Set("uPrevTanHalfFov", _prevTanHalfFov);
+            _taaShader.Set("uReset", _historyValid ? 0 : 1);
+            _taaShader.Set("uBlend", 0.1f);
+            _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+
+            presentTex = _historyTex[cur];
+            _historyCur = cur;
+            _historyValid = true;
+        }
+
+        // Final pass: present to the screen (retro filter + crosshair applied here,
+        // after TAA, so the dither is not averaged away by accumulation).
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         _gl.Viewport(0, 0, (uint)width, (uint)height);
         _presentShader.Use();
-        BindTexture(0, _historyTex[cur]);
+        BindTexture(0, presentTex);
         _presentShader.Set("uImage", 0);
         _presentShader.Set("uResolution", width, height);
+        _presentShader.Set("uRetro", RetroPalette ? 1 : 0);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
 
-        _historyCur = cur;
-        _historyValid = true;
         StorePrevCamera(camera);
     }
 
@@ -362,6 +374,8 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Set("uSunDir", SunDirection);
         _shader.Set("uShadows", Shadows ? 1 : 0);
         _shader.Set("uAo", AmbientOcclusion ? 1 : 0);
+        _shader.Set("uBlob", BlobVoxels ? 1 : 0);
+        _shader.Set("uSphere", SphereVoxels ? 1 : 0);
         _shader.Set("uMaxBrickSteps", MaxBrickSteps);
         _shader.Set("uShadowSamples", ShadowSamples);
         _shader.Set("uShadowCache", ShadowCache ? 1 : 0);

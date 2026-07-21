@@ -42,6 +42,8 @@ uniform vec2  uJitter;       // sub-pixel NDC offset for TAA (zero when disabled
 uniform vec3  uSunDir;       // normalised, points toward the sun
 uniform int   uShadows;
 uniform int   uAo;              // 0 = ambient occlusion off
+uniform int   uBlob;            // 1 = round voxels into smooth blobs (near field)
+uniform int   uSphere;          // 1 = render each voxel as a sphere (near field)
 uniform int   uMaxBrickSteps;
 uniform int   uShadowSamples;   // sub-samples per axis across a voxel face (NxN)
 uniform int   uShadowCache;     // 0 = recompute per pixel, 1 = use the face cache
@@ -60,6 +62,7 @@ const float FOG_DENSITY  = 0.00004;    // per voxel of distance; light enough to
 const float SHADOW_RANGE = 2500.0;     // voxels; long enough for terrain to shade itself
 const float POINT_FALLOFF = 0.0030;    // inverse-square attenuation scale (per voxel^2)
 const float POINT_MIN     = 0.03;      // below this, a surface receives no meaningful light
+const float SPHERE_R      = 0.7;      // sphere-voxel radius; >0.71 fully merges, <0.5 gaps
 
 uint brickAt(ivec3 bc)
 {
@@ -82,15 +85,17 @@ uint mipAt(uint slot, ivec3 mc)
     return (word >> ((li & 3u) * 8u)) & 0xFFu;
 }
 
-// Direct solidity query for a world voxel (index -> pool), for ambient occlusion.
-bool solidAt(ivec3 v)
+// Direct material query for a world voxel (index -> pool). 0 = air / out of bounds.
+uint materialAt(ivec3 v)
 {
-    if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, uBrickDims * B))) return false;
+    if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, uBrickDims * B))) return 0u;
     uint entry = brickAt(v >> 3);
-    if (entry == 0u) return false;
-    if ((entry & UNIFORM_FLAG) != 0u) return true;
-    return voxelAt(entry - 1u, v & 7) != 0u;
+    if (entry == 0u) return 0u;
+    if ((entry & UNIFORM_FLAG) != 0u) return entry & 0xFFu;
+    return voxelAt(entry - 1u, v & 7);
 }
+
+bool solidAt(ivec3 v) { return materialAt(v) != 0u; }
 
 // Hash of an integer voxel cell, in [0,1]. Everything procedural here builds on it.
 float hashCell(ivec3 v)
@@ -331,11 +336,34 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                     uint m = voxelAt(slot, lv);
                     if (m != 0u)
                     {
-                        hit.t = tv;
-                        hit.normal = nv;
-                        hit.material = m;
-                        hit.voxel = bc * B + lv;
-                        return true;
+                        if (uSphere == 0)
+                        {
+                            hit.t = tv;
+                            hit.normal = nv;
+                            hit.material = m;
+                            hit.voxel = bc * B + lv;
+                            return true;
+                        }
+
+                        // Bead voxel: intersect this voxel's sphere. On a miss, keep
+                        // marching so gaps between beads reveal what is behind.
+                        vec3 centre = vec3(bc * B + lv) + 0.5;
+                        vec3 oc = ro - centre;
+                        float bb = dot(oc, rd);
+                        float disc = bb * bb - (dot(oc, oc) - SPHERE_R * SPHERE_R);
+                        if (disc >= 0.0)
+                        {
+                            float th = -bb - sqrt(disc);
+                            if (th > 1e-3 && th <= t1)
+                            {
+                                hit.t = th;
+                                hit.normal = normalize(ro + rd * th - centre);
+                                hit.material = m;
+                                hit.voxel = bc * B + lv;
+                                return true;
+                            }
+                        }
+                        // fall through: sphere missed, advance the DDA
                     }
 
                     if (nextVoxel.x < nextVoxel.y && nextVoxel.x < nextVoxel.z)
@@ -733,6 +761,85 @@ float faceAO(ivec3 hv, vec3 n, vec3 hitP)
     return mix(mix(a00, a10, fu), mix(a01, a11, fu), fv);
 }
 
+// --- Rounded-blob voxels -----------------------------------------------------
+// A trilinear occupancy field over the voxel grid; its 0.5 isosurface is a
+// smoothed, rounded version of the blocky geometry.
+float densityAt(vec3 p)
+{
+    vec3 q = p - 0.5;                 // voxel centres sit at integer + 0.5
+    vec3 b = floor(q);
+    vec3 f = q - b;
+    ivec3 bi = ivec3(b);
+
+    float c000 = float(solidAt(bi + ivec3(0, 0, 0)));
+    float c100 = float(solidAt(bi + ivec3(1, 0, 0)));
+    float c010 = float(solidAt(bi + ivec3(0, 1, 0)));
+    float c110 = float(solidAt(bi + ivec3(1, 1, 0)));
+    float c001 = float(solidAt(bi + ivec3(0, 0, 1)));
+    float c101 = float(solidAt(bi + ivec3(1, 0, 1)));
+    float c011 = float(solidAt(bi + ivec3(0, 1, 1)));
+    float c111 = float(solidAt(bi + ivec3(1, 1, 1)));
+
+    return mix(mix(mix(c000, c100, f.x), mix(c010, c110, f.x), f.y),
+               mix(mix(c001, c101, f.x), mix(c011, c111, f.x), f.y), f.z);
+}
+
+// Outward surface normal from the density gradient (tetrahedron taps). Density
+// rises into the solid, so the outward normal is the negated gradient.
+vec3 blobNormal(vec3 p)
+{
+    const float h = 0.35;
+    vec2 k = vec2(1.0, -1.0);
+    vec3 g = k.xyy * densityAt(p + k.xyy * h)
+           + k.yyx * densityAt(p + k.yyx * h)
+           + k.yxy * densityAt(p + k.yxy * h)
+           + k.xxx * densityAt(p + k.xxx * h);
+    float gl = length(g);
+    return gl > 1e-5 ? -g / gl : vec3(0.0, 1.0, 0.0);
+}
+
+// Refines a flat DDA hit into the blob isosurface: fixed-step march of the density
+// field around the hit, then a linear crossing solve. Returns false (keep the flat
+// hit) if no crossing is found.
+bool blobRefine(vec3 ro, vec3 rd, float tDda, out float outT, out vec3 outN, out uint outMat, out ivec3 outVox)
+{
+    const float THRESH = 0.5;
+    const float STEP = 0.25;
+
+    float ts = tDda - 1.0;
+    float prev = densityAt(ro + rd * ts) - THRESH;
+
+    for (int i = 0; i < 16; i++)
+    {
+        ts += STEP;
+        float d = densityAt(ro + rd * ts) - THRESH;
+        if (d > 0.0 && prev <= 0.0)
+        {
+            float frac = -prev / max(d - prev, 1e-5);
+            outT = ts - STEP + frac * STEP;
+            vec3 p = ro + rd * outT;
+            outN = blobNormal(p);
+
+            ivec3 mv = ivec3(floor(p - outN * 0.5));   // step inside for the material
+            if (materialAt(mv) == 0u) mv = ivec3(floor(p));
+            outVox = mv;
+            outMat = materialAt(mv);
+            return outMat != 0u;
+        }
+        prev = d;
+        if (ts > tDda + 1.0) break;
+    }
+    return false;
+}
+
+vec3 snapAxis(vec3 n)
+{
+    vec3 a = abs(n);
+    if (a.x >= a.y && a.x >= a.z) return vec3(sign(n.x), 0.0, 0.0);
+    if (a.y >= a.z)               return vec3(0.0, sign(n.y), 0.0);
+    return vec3(0.0, 0.0, sign(n.z));
+}
+
 void main()
 {
     // uJitter is a sub-pixel NDC offset for temporal anti-aliasing (zero when off).
@@ -751,29 +858,47 @@ void main()
 
     if (hitWorld)
     {
+        // Round the blocky hit into the smooth blob isosurface (near field only --
+        // it is costly and invisible far off). A failed refine keeps the flat hit.
+        if (uBlob != 0 && detailAt(hit.t) > 0.4)
+        {
+            float bt; vec3 bn; uint bm; ivec3 bv;
+            if (blobRefine(uCamPos, rd, hit.t, bt, bn, bm, bv))
+            {
+                hit.t = bt; hit.normal = bn; hit.material = bm; hit.voxel = bv;
+                worldT = bt;
+            }
+        }
+
+        // Smooth normal drives diffuse/ambient; face-based effects (voxel-quantised
+        // shadow, AO, point light) need an axis-aligned normal, so snap it when the
+        // hit normal is smooth (blobs or spheres).
+        vec3 shadeN = hit.normal;
+        vec3 faceN  = (uBlob != 0 || uSphere != 0) ? snapAxis(hit.normal) : hit.normal;
+
         vec3 albedo = surfaceColor(hit.material, hit.voxel, detailAt(hit.t));
 
-        float ndl = max(dot(hit.normal, uSunDir), 0.0);
+        float ndl = max(dot(shadeN, uSunDir), 0.0);
         // One shadow value for the whole voxel face, quantised to a coverage ratio.
         // Cached world self-shadow times the uncached shape-cast factor.
         float shadow = 1.0;
         if (uShadows != 0 && ndl > 0.0)
-            shadow = faceShadow(hit.voxel, hit.normal) * shapeSunFactor(hit.voxel, hit.normal);
+            shadow = faceShadow(hit.voxel, faceN) * shapeSunFactor(hit.voxel, faceN);
 
         // Ambient occlusion darkens crevices. Geometry-based, so it is independent of
         // the sun and stacks under the hard shadow. Skipped far off (invisible there,
         // and mip hits have no fine neighbourhood).
         float ao = 1.0;
         if (uAo != 0 && detailAt(hit.t) > 0.01)
-            ao = faceAO(hit.voxel, hit.normal, uCamPos + rd * hit.t);
+            ao = faceAO(hit.voxel, faceN, uCamPos + rd * hit.t);
         float aoFactor = 0.35 + 0.65 * ao;   // floor so corners are not pitch black
 
         // Sky-dominant ambient plus a weak bounce off the ground.
-        vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), hit.normal.y * -0.5 + 0.5);
+        vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), shadeN.y * -0.5 + 0.5);
         vec3 lit = albedo * (ambient * aoFactor + vec3(1.0, 0.95, 0.85) * ndl * shadow * 1.15);
 
         // Add the orbiting point light on top of the sun/ambient.
-        lit += albedo * pointLight(hit.voxel, hit.normal);
+        lit += albedo * pointLight(hit.voxel, faceN);
 
         float fog = 1.0 - exp(-hit.t * FOG_DENSITY);
         color = mix(lit, skyColor(rd), fog);

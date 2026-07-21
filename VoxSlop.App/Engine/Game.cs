@@ -157,6 +157,9 @@ public sealed class Game : IDisposable
         Console.WriteLine("  F            toggle walk / noclip");
         Console.WriteLine("  L            toggle sun shadows");
         Console.WriteLine("  O            toggle ambient occlusion");
+        Console.WriteLine("  V            toggle rounded-blob voxels");
+        Console.WriteLine("  B            toggle sphere / bead voxels");
+        Console.WriteLine("  K            toggle retro palette + dither");
         Console.WriteLine("  P            pause / resume the sun");
         Console.WriteLine("  C            toggle per-voxel-face shadow cache");
         Console.WriteLine("  G            toggle the orbiting point light");
@@ -182,6 +185,15 @@ public sealed class Game : IDisposable
                 break;
             case Key.O:
                 _renderer.AmbientOcclusion = !_renderer.AmbientOcclusion;
+                break;
+            case Key.V:
+                _renderer.BlobVoxels = !_renderer.BlobVoxels;
+                break;
+            case Key.B:
+                _renderer.SphereVoxels = !_renderer.SphereVoxels;
+                break;
+            case Key.K:
+                _renderer.RetroPalette = !_renderer.RetroPalette;
                 break;
             case Key.P:
                 _sunPaused = !_sunPaused;
