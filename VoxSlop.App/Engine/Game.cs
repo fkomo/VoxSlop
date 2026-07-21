@@ -69,6 +69,9 @@ public sealed class Game : IDisposable
         //new(1.0f, 0.4f, 0.95f),  // magenta
     ];
 
+    // Live spinning shapes, rendered each frame (not baked into the world).
+    private readonly List<DynamicShape> _shapes = [];
+
     public Game()
     {
         var options = WindowOptions.Default with
@@ -104,6 +107,8 @@ public sealed class Game : IDisposable
         string shaderDir = Path.Combine(AppContext.BaseDirectory, "Render", "Shaders");
         _renderer = new RaymarchRenderer(_gl, _world, shaderDir);
         _player = new PlayerController(_world, PlayerController.FindSpawn(_world));
+        BuildDynamicShapes();
+        _player.DynamicShapes = _shapes;
 
         _input = _window.CreateInput();
         _keyboard = _input.Keyboards[0];
@@ -115,6 +120,20 @@ public sealed class Game : IDisposable
 
         SetMouseCaptured(true);
         PrintControls();
+    }
+
+    private void BuildDynamicShapes()
+    {
+        // Float the objects near spawn so they are immediately in view; they spin
+        // in place. Colours mirror the concrete/rust world materials.
+        var concrete = new Vector3(0.70f, 0.68f, 0.64f);
+        var rust = new Vector3(0.83f, 0.42f, 0.14f);
+        Vector3 near(float x, float y, float z) => _player.FeetPosition + new Vector3(x, y, z);
+
+        _shapes.Add(DynamicShape.Cube(near(6f, 3f, 4f), 2.5f, new Vector3(0.08f, 0.14f, 0.05f), concrete)); // 5 m cube
+        _shapes.Add(DynamicShape.Box(near(-7f, 3f, 3f), new Vector3(4f, 0.75f, 1.5f),                       // 8 x 1.5 x 3 m slab
+                                     new Vector3(0.03f, 0.11f, 0.06f), concrete));
+        _shapes.Add(DynamicShape.Sphere(near(0f, 3.5f, -6f), 1.4f, new Vector3(0.09f, 0.09f, 0.09f), rust));
     }
 
     private static void PrintControls()
@@ -189,11 +208,20 @@ public sealed class Game : IDisposable
         if (_mouseCaptured && _lookDelta != Vector2.Zero) _player.Look(_lookDelta);
         _lookDelta = Vector2.Zero;
 
+        // Advance shapes before the player moves, so collision tests their current pose.
+        UpdateShapes(deltaSeconds);
+
         if (_mouseCaptured) _player.Update(_keyboard, (float)deltaSeconds);
 
         UpdateSun(deltaSeconds);
         UpdatePointLight(deltaSeconds);
         UpdateTitle(deltaSeconds);
+    }
+
+    private void UpdateShapes(double deltaSeconds)
+    {
+        foreach (var shape in _shapes) shape.Advance((float)deltaSeconds);
+        _renderer.UpdateDynamicShapes(_shapes);
     }
 
     private void UpdatePointLight(double deltaSeconds)

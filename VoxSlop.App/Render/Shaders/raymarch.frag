@@ -15,6 +15,18 @@ layout(std430, binding = 1) readonly buffer VoxelPool  { uint voxels[]; };
 // coherent so writes from earlier draws are visible to later ones after a barrier.
 layout(std430, binding = 2) coherent buffer ShadowCache { uvec4 shadowCache[]; };
 
+// Live (spinning) shapes, re-voxelised onto the world grid each frame. Packed as
+// 5 vec4 per shape; see RaymarchRenderer for the exact byte layout.
+//   centreType : xyz = centre (voxel units), w = type (0 = box, 1 = sphere)
+//   ax/ay/az   : xyz = orthonormal world-space axis, w = half extent (radius in ax.w)
+//   colour     : rgb
+struct DynShape { vec4 centreType; vec4 ax; vec4 ay; vec4 az; vec4 colour; };
+layout(std430, binding = 3) readonly buffer DynamicShapes { DynShape dynShapes[]; };
+uniform int uShapeCount;
+
+// Defined below (uses rayBox); prototyped here so the shadow code above can call it.
+bool shapesOcclude(vec3 ro, vec3 rd, float tMax);
+
 uniform ivec3 uBrickDims;    // grid size in bricks
 uniform vec3  uCamPos;       // eye position in VOXEL units
 uniform vec3  uCamRight;
@@ -392,7 +404,9 @@ float pointFaceVisible(ivec3 voxel, vec3 n, vec3 lightPos)
 
         Hit blocker;
         // Stop short of the light so we don't count geometry at or behind it.
-        if (!trace(origin, dir, dist - 0.5, blocker)) lit += 1.0;
+        // A sample is lit only if neither the world nor any live shape blocks it.
+        if (!trace(origin, dir, dist - 0.5, blocker) && !shapesOcclude(origin, dir, dist - 0.5))
+            lit += 1.0;
     }
 
     return lit * (inv * inv);
@@ -442,6 +456,136 @@ bool rayBox(vec3 ro, vec3 rd, vec3 lo, vec3 hi, out float t, out vec3 n)
     return true;
 }
 
+bool insideDynShape(int i, vec3 p)
+{
+    DynShape s = dynShapes[i];
+    vec3 d = p - s.centreType.xyz;
+    if (s.centreType.w > 0.5)                 // sphere
+        return dot(d, d) <= s.ax.w * s.ax.w;
+    return abs(dot(d, s.ax.xyz)) <= s.ax.w
+        && abs(dot(d, s.ay.xyz)) <= s.ay.w
+        && abs(dot(d, s.az.xyz)) <= s.az.w;
+}
+
+void dynShapeAabb(int i, out vec3 lo, out vec3 hi)
+{
+    DynShape s = dynShapes[i];
+    vec3 c = s.centreType.xyz;
+    if (s.centreType.w > 0.5) { lo = c - s.ax.w; hi = c + s.ax.w; return; }
+    vec3 h = s.ax.w * abs(s.ax.xyz) + s.ay.w * abs(s.ay.xyz) + s.az.w * abs(s.az.xyz);
+    lo = c - h; hi = c + h;
+}
+
+// Marches the WORLD voxel grid through one shape's AABB and returns the first
+// world voxel whose centre lies inside the shape. World-axis-aligned voxels ->
+// the spinning shape keeps the block look instead of smooth rotated faces.
+bool traceOneShape(int i, vec3 ro, vec3 rd, float tMax, out float outT, out vec3 outN, out ivec3 outVox)
+{
+    vec3 lo, hi;
+    dynShapeAabb(i, lo, hi);
+
+    float tEnter; vec3 enterN;
+    if (!rayBox(ro, rd, lo, hi, tEnter, enterN)) return false;
+    if (tEnter > tMax) return false;
+
+    vec3 inv = 1.0 / rd;
+    vec3 a = (lo - ro) * inv;
+    vec3 b = (hi - ro) * inv;
+    vec3 tmax3 = max(a, b);
+    float tStop = min(tMax, min(min(tmax3.x, tmax3.y), tmax3.z));
+
+    float t = max(tEnter, 0.0) + 1e-3;
+    vec3  sgn = sign(rd);
+    ivec3 istep = ivec3(sgn);
+    vec3  tDelta = abs(inv);
+
+    ivec3 v = ivec3(floor(ro + rd * t));
+    vec3 tNext;
+    for (int k = 0; k < 3; k++)
+    {
+        float bound = float(v[k]) + (sgn[k] > 0.0 ? 1.0 : 0.0);
+        tNext[k] = (rd[k] == 0.0) ? 1e30 : (bound - ro[k]) * inv[k];
+    }
+    vec3 n = enterN;
+
+    // Cap covers the long axis of the biggest shape (a few hundred voxels).
+    for (int k = 0; k < 512; k++)
+    {
+        if (t > tStop) return false;
+        if (insideDynShape(i, vec3(v) + 0.5)) { outT = t; outN = n; outVox = v; return true; }
+
+        if (tNext.x < tNext.y && tNext.x < tNext.z)
+        {
+            t = tNext.x; tNext.x += tDelta.x; v.x += istep.x; n = vec3(-sgn.x, 0.0, 0.0);
+        }
+        else if (tNext.y < tNext.z)
+        {
+            t = tNext.y; tNext.y += tDelta.y; v.y += istep.y; n = vec3(0.0, -sgn.y, 0.0);
+        }
+        else
+        {
+            t = tNext.z; tNext.z += tDelta.z; v.z += istep.z; n = vec3(0.0, 0.0, -sgn.z);
+        }
+    }
+    return false;
+}
+
+// Nearest hit across all live shapes, within tMax.
+bool traceShapes(vec3 ro, vec3 rd, float tMax, out float bt, out vec3 bn, out ivec3 bv, out vec3 bcol)
+{
+    bool hitAny = false;
+    bt = tMax;
+    for (int i = 0; i < uShapeCount; i++)
+    {
+        float t; vec3 n; ivec3 v;
+        if (traceOneShape(i, ro, rd, bt, t, n, v) && t < bt)
+        {
+            bt = t; bn = n; bv = v; bcol = dynShapes[i].colour.rgb; hitAny = true;
+        }
+    }
+    return hitAny;
+}
+
+// Any live shape blocking the segment [ro, ro + rd*tMax]? Used as an occluder for
+// shadow rays, so shapes cast shadows onto the world and onto each other.
+bool shapesOcclude(vec3 ro, vec3 rd, float tMax)
+{
+    for (int i = 0; i < uShapeCount; i++)
+    {
+        float t; vec3 n; ivec3 v;
+        if (traceOneShape(i, ro, rd, tMax, t, n, v)) return true;
+    }
+    return false;
+}
+
+// Sun-shadow coverage of a face considering ONLY the live shapes. Kept separate
+// from the cached world shadow so the cache stays valid: shapes move every frame,
+// but the world's self-shadow only changes when the sun does. Multiply the two.
+float shapeSunFactor(ivec3 voxel, vec3 n)
+{
+    if (uShapeCount == 0) return 1.0;
+
+    vec3 faceCentre = vec3(voxel) + 0.5 + n * 0.5;
+    vec3 t1 = (abs(n.y) > 0.5) ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t2 = normalize(cross(n, t1));
+    t1 = cross(t2, n);
+
+    int s = clamp(uShadowSamples, 1, 8);
+    float inv = 1.0 / float(s);
+    float lit = 0.0;
+
+    for (int i = 0; i < s; i++)
+    for (int j = 0; j < s; j++)
+    {
+        float u = (float(i) + 0.5) * inv - 0.5;
+        float v = (float(j) + 0.5) * inv - 0.5;
+        vec3 origin = faceCentre + t1 * u + t2 * v + n * 1e-2;
+        if (!shapesOcclude(origin, uSunDir, SHADOW_RANGE)) lit += 1.0;
+    }
+
+    return lit * (inv * inv);
+}
+
 void main()
 {
     vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;
@@ -463,9 +607,10 @@ void main()
 
         float ndl = max(dot(hit.normal, uSunDir), 0.0);
         // One shadow value for the whole voxel face, quantised to a coverage ratio.
+        // Cached world self-shadow times the uncached shape-cast factor.
         float shadow = 1.0;
         if (uShadows != 0 && ndl > 0.0)
-            shadow = faceShadow(hit.voxel, hit.normal);
+            shadow = faceShadow(hit.voxel, hit.normal) * shapeSunFactor(hit.voxel, hit.normal);
 
         // Sky-dominant ambient plus a weak bounce off the ground.
         vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), hit.normal.y * -0.5 + 0.5);
@@ -480,6 +625,27 @@ void main()
     else
     {
         color = skyColor(rd);
+    }
+
+    // Live spinning shapes, voxelised onto the world grid and depth-composited with
+    // the terrain. Shaded like a world voxel; receive shadows from the world and
+    // from other shapes (and their own blocky self-shadowing).
+    float shapeT; vec3 shapeN; ivec3 shapeV; vec3 shapeCol;
+    if (uShapeCount > 0 && traceShapes(uCamPos, rd, worldT, shapeT, shapeN, shapeV, shapeCol))
+    {
+        vec3 albedo = shapeCol * (0.90 + 0.20 * hashCell(shapeV));
+        float ndl = max(dot(shapeN, uSunDir), 0.0);
+        float shadow = 1.0;
+        if (uShadows != 0 && ndl > 0.0)                // uncached: shapes move every frame
+            shadow = voxelFaceLight(shapeV, shapeN) * shapeSunFactor(shapeV, shapeN);
+
+        vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), shapeN.y * -0.5 + 0.5);
+        vec3 lit = albedo * (ambient + vec3(1.0, 0.95, 0.85) * ndl * shadow * 1.15);
+        lit += albedo * pointLight(shapeV, shapeN);
+
+        float fog = 1.0 - exp(-shapeT * FOG_DENSITY);
+        color = mix(lit, skyColor(rd), fog);
+        worldT = shapeT;   // let the light-source voxel below depth-test against shapes
     }
 
     // Draw the light source as the single emissive voxel it occupies, when it is

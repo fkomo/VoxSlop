@@ -24,7 +24,7 @@ public static class WorldStore
     /// generation itself changes (new/edited shapes), since the cache does not hash
     /// the generation code. Forces a rebuild.
     /// </summary>
-    private const int LayoutVersion = 4;
+    private const int LayoutVersion = 5;
 
     /// <summary>Loads a matching cached world, or generates a fresh one and caches it.</summary>
     public static VoxelWorld LoadOrGenerate(int brickDimX, int brickDimY, int brickDimZ, int seed, string path)

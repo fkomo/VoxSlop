@@ -283,34 +283,8 @@ public static class WorldGen
             shapes.Add(Shape.Box(cx - thick - 1, baseY, cz - V(0.5f), cx + thick + 1, baseY + V(2.5f), cz + V(0.5f), Materials.Air, subtractive: true));
         }
 
-        // A floating sphere: the cheapest way to see that this is real volume tracing.
-        {
-            int cx = dimX / 2 - V(4f);
-            int cz = dimZ / 2 - V(2f);
-            shapes.Add(Shape.Sphere(cx, GroundAt(cx, cz) + V(1.6f), cz, V(0.9f), Materials.Rust));
-        }
-
-        // A large rotated concrete cube near spawn. Its centre sits ~3 m up but the
-        // 5 m body is tilted on three axes, so its lower corners dip well into the
-        // terrain and the voxelised clipping against the ground is clearly visible.
-        {
-            int cx = dimX / 2 + V(6f);
-            int cz = dimZ / 2 + V(5f);
-            var center = new Vector3(cx, GroundAt(cx, cz) + V(3f), cz);
-            var rotation = new Vector3(0.5f, 0.9f, 0.3f);          // fixed tilt, radians
-            shapes.Add(Shape.Cube(center, V(2.5f), rotation, Materials.Concrete)); // 5 m cube
-        }
-
-        // A large tilted concrete beam (unequal extents, so it reads as a slab, not
-        // a cube), on the far side of spawn and leaning into the ground.
-        {
-            int cx = dimX / 2 - V(7f);
-            int cz = dimZ / 2 + V(3f);
-            var center = new Vector3(cx, GroundAt(cx, cz) + V(2.5f), cz);
-            var half = new Vector3(V(4f), V(0.75f), V(1.5f));      // 8 x 1.5 x 3 m slab
-            var rotation = new Vector3(0.15f, 0.6f, 0.85f);        // fixed tilt, radians
-            shapes.Add(Shape.OrientedBox(center, half, rotation, Materials.Concrete));
-        }
+        // The cube, beam and sphere are now live spinning shapes (see Game /
+        // DynamicShape), rendered each frame rather than baked here.
 
         return [.. shapes];
     }

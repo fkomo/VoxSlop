@@ -15,9 +15,15 @@ public sealed class RaymarchRenderer : IDisposable
     private const uint BrickIndexBinding = 0;
     private const uint VoxelPoolBinding = 1;
     private const uint ShadowCacheBinding = 2;
+    private const uint DynamicShapeBinding = 3;
 
     /// <summary>Number of slots in the voxel-face shadow cache (16 bytes each = 32 MB).</summary>
     public const uint ShadowCacheSlots = 1u << 21;
+
+    /// <summary>Upper bound on live shapes; the SSBO is sized for this many.</summary>
+    public const int MaxDynamicShapes = 32;
+
+    private const int FloatsPerShape = 20; // 5 vec4
 
     private readonly GL _gl;
     private readonly VoxelWorld _world;
@@ -27,6 +33,10 @@ public sealed class RaymarchRenderer : IDisposable
     private readonly uint _brickIndexBuffer;
     private readonly uint _voxelPoolBuffer;
     private readonly uint _shadowCacheBuffer;
+    private readonly uint _dynamicShapeBuffer;
+
+    private readonly float[] _shapeScratch = new float[MaxDynamicShapes * FloatsPerShape];
+    private int _dynamicShapeCount;
 
     private Shader _shader;
 
@@ -93,6 +103,54 @@ public sealed class RaymarchRenderer : IDisposable
         // Zero-initialised: slots must not spuriously match epoch 1 with garbage data.
         _shadowCacheBuffer = UploadStorage(ShadowCacheBinding, new uint[ShadowCacheSlots * 4],
             BufferUsageARB.DynamicCopy);
+
+        // Re-uploaded every frame with the current shape transforms; starts empty.
+        _dynamicShapeBuffer = _gl.GenBuffer();
+        _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, _dynamicShapeBuffer);
+        _gl.BufferData<float>(
+            BufferTargetARB.ShaderStorageBuffer,
+            (nuint)(_shapeScratch.Length * sizeof(float)),
+            new ReadOnlySpan<float>(new float[_shapeScratch.Length]),
+            BufferUsageARB.DynamicDraw);
+        _gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, DynamicShapeBinding, _dynamicShapeBuffer);
+    }
+
+    /// <summary>
+    /// Packs the current shapes and uploads them for this frame. Call once per
+    /// frame before <see cref="Render"/>; shapes beyond <see cref="MaxDynamicShapes"/>
+    /// are dropped.
+    /// </summary>
+    public void UpdateDynamicShapes(IReadOnlyList<DynamicShape> shapes)
+    {
+        int count = Math.Min(shapes.Count, MaxDynamicShapes);
+        float inv = 1f / VoxelWorld.VoxelSize;
+
+        for (int i = 0; i < count; i++)
+        {
+            DynamicShape s = shapes[i];
+            var (ax, ay, az) = s.Axes();
+            Vector3 c = s.Center * inv;
+            Vector3 h = s.HalfExtents * inv; // for a sphere, h.X is the radius
+            int o = i * FloatsPerShape;
+
+            _shapeScratch[o + 0] = c.X;  _shapeScratch[o + 1] = c.Y;  _shapeScratch[o + 2] = c.Z;
+            _shapeScratch[o + 3] = s.IsSphere ? 1f : 0f;
+            _shapeScratch[o + 4] = ax.X; _shapeScratch[o + 5] = ax.Y; _shapeScratch[o + 6] = ax.Z;
+            _shapeScratch[o + 7] = h.X;
+            _shapeScratch[o + 8] = ay.X; _shapeScratch[o + 9] = ay.Y; _shapeScratch[o + 10] = ay.Z;
+            _shapeScratch[o + 11] = h.Y;
+            _shapeScratch[o + 12] = az.X; _shapeScratch[o + 13] = az.Y; _shapeScratch[o + 14] = az.Z;
+            _shapeScratch[o + 15] = h.Z;
+            _shapeScratch[o + 16] = s.Color.X; _shapeScratch[o + 17] = s.Color.Y; _shapeScratch[o + 18] = s.Color.Z;
+            _shapeScratch[o + 19] = 0f;
+        }
+
+        _dynamicShapeCount = count;
+        _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, _dynamicShapeBuffer);
+        _gl.BufferSubData<float>(
+            BufferTargetARB.ShaderStorageBuffer, 0,
+            (nuint)(count * FloatsPerShape * sizeof(float)),
+            new ReadOnlySpan<float>(_shapeScratch, 0, count * FloatsPerShape));
     }
 
     private uint UploadStorage(uint binding, uint[] data, BufferUsageARB usage = BufferUsageARB.StaticDraw)
@@ -155,6 +213,7 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Set("uPointPos", PointLightPosition / VoxelWorld.VoxelSize);
         _shader.Set("uPointColor", PointLightColor);
         _shader.Set("uPointStrength", PointLightStrength);
+        _shader.Set("uShapeCount", _dynamicShapeCount);
 
         _gl.BindVertexArray(_vao);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
@@ -169,6 +228,7 @@ public sealed class RaymarchRenderer : IDisposable
         _gl.DeleteBuffer(_brickIndexBuffer);
         _gl.DeleteBuffer(_voxelPoolBuffer);
         _gl.DeleteBuffer(_shadowCacheBuffer);
+        _gl.DeleteBuffer(_dynamicShapeBuffer);
         _gl.DeleteVertexArray(_vao);
     }
 }

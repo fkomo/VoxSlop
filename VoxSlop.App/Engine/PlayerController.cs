@@ -23,6 +23,9 @@ public sealed class PlayerController
     private const float JumpSpeed = 7.2f;
     private const float MouseSensitivity = 0.0022f;
 
+    // Max shape depenetration per frame, metres; deep overlaps ease out over frames.
+    private const float MaxShapePush = 0.5f;
+
     // At 1 cm resolution every slope is a staircase of tiny ledges, so horizontal
     // motion has to be allowed to climb over them or the player wedges instantly.
     private const float StepHeight = 0.65f;
@@ -37,6 +40,9 @@ public sealed class PlayerController
     public bool Flying { get; private set; }
     public bool OnGround => _onGround;
     public Vector3 FeetPosition => _feet;
+
+    /// <summary>Live shapes the player also collides against, or null for terrain only.</summary>
+    public IReadOnlyList<DynamicShape>? DynamicShapes { get; set; }
 
     public PlayerController(VoxelWorld world, Vector3 spawnFeet)
     {
@@ -97,8 +103,52 @@ public sealed class PlayerController
             MoveAndSlide(_velocity * dt);
         }
 
+        ResolveDynamicShapes(dt);
         ClampToWorld();
         SyncCamera();
+    }
+
+    /// <summary>
+    /// Pushes the player out of any overlapping live shape (so a moving shape shoves
+    /// the player), carries the player along the shape's surface motion, and applies
+    /// the reaction back onto the shape.
+    /// </summary>
+    private void ResolveDynamicShapes(float dt)
+    {
+        if (DynamicShapes is not { } shapes) return;
+
+        // A couple of passes so a push out of one shape that lands in another still resolves.
+        for (int iter = 0; iter < 2; iter++)
+        {
+            bool any = false;
+            foreach (var shape in shapes)
+            {
+                var min = new Vector3(_feet.X - HalfWidth, _feet.Y, _feet.Z - HalfWidth);
+                var max = new Vector3(_feet.X + HalfWidth, _feet.Y + Height, _feet.Z + HalfWidth);
+
+                if (!shape.TryResolveAabb(min, max, out Vector3 push, out Vector3 normal, out Vector3 contact))
+                    continue;
+
+                any = true;
+                // Cap per-frame correction so a deep overlap eases out instead of teleporting.
+                if (push.Length() > MaxShapePush) push = normal * MaxShapePush;
+                _feet += push;                                   // depenetrate
+                if (push.Y > 0.001f) _onGround = true;           // pushed upward => standing on it
+
+                // Cancel the player's velocity heading into the shape.
+                float vn = Vector3.Dot(_velocity, normal);
+                if (vn < 0f) _velocity -= normal * vn;
+
+                // Carry: nudge the player along the shape surface's tangential motion.
+                Vector3 sv = shape.SurfaceVelocityAt(contact);
+                Vector3 tangential = sv - normal * Vector3.Dot(sv, normal);
+                _feet += tangential * dt;
+
+                // Reaction: the player pushes the shape the opposite way.
+                shape.ApplyPush(-normal, push.Length());
+            }
+            if (!any) break;
+        }
     }
 
     /// <summary>
@@ -168,7 +218,13 @@ public sealed class PlayerController
     {
         var min = new Vector3(_feet.X - HalfWidth, _feet.Y, _feet.Z - HalfWidth);
         var max = new Vector3(_feet.X + HalfWidth, _feet.Y + Height, _feet.Z + HalfWidth);
-        return _world.OverlapsSolid(min, max);
+        if (_world.OverlapsSolid(min, max)) return true;
+
+        if (DynamicShapes is { } shapes)
+            foreach (var shape in shapes)
+                if (shape.OverlapsAabb(min, max)) return true;
+
+        return false;
     }
 
     /// <summary>Keeps the player inside the grid — outside it every voxel reads as air.</summary>
