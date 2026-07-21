@@ -74,8 +74,8 @@ public static class WorldStore
             bw.Write((long)world.Pool.Length);
             bw.Flush();
 
-            fs.Write(MemoryMarshal.AsBytes<uint>(world.Index));
-            fs.Write(MemoryMarshal.AsBytes<uint>(world.Pool));
+            WriteUints(fs, world.Index);
+            WriteUints(fs, world.Pool);
         }
 
         if (File.Exists(path)) File.Delete(path);
@@ -119,8 +119,8 @@ public static class WorldStore
             if (poolLen < 0 || poolLen % VoxelWorld.UintsPerBrick != 0) return Reject(path, "corrupt pool length");
 
             var pool = new uint[poolLen];
-            fs.ReadExactly(MemoryMarshal.AsBytes(loaded.Index.AsSpan()));
-            fs.ReadExactly(MemoryMarshal.AsBytes(pool.AsSpan()));
+            ReadUints(fs, loaded.Index);
+            ReadUints(fs, pool);
             loaded.ReplacePool(pool);
 
             world = loaded;
@@ -138,5 +138,27 @@ public static class WorldStore
     {
         Console.WriteLine($"Ignoring world cache '{path}': {reason}. Regenerating.");
         return false;
+    }
+
+    // Arrays are written/read in chunks: at high resolution the pool exceeds 2 GB,
+    // and a byte span (MemoryMarshal.AsBytes) cannot be longer than int.MaxValue.
+    private const int ChunkUints = 128 * 1024 * 1024; // 512 MB per chunk
+
+    private static void WriteUints(Stream fs, uint[] data)
+    {
+        for (int off = 0; off < data.Length; off += ChunkUints)
+        {
+            int len = Math.Min(ChunkUints, data.Length - off);
+            fs.Write(MemoryMarshal.AsBytes(data.AsSpan(off, len)));
+        }
+    }
+
+    private static void ReadUints(Stream fs, uint[] data)
+    {
+        for (int off = 0; off < data.Length; off += ChunkUints)
+        {
+            int len = Math.Min(ChunkUints, data.Length - off);
+            fs.ReadExactly(MemoryMarshal.AsBytes(data.AsSpan(off, len)));
+        }
     }
 }

@@ -22,7 +22,7 @@ public sealed class VoxelWorld
     public const int UintsPerBrick = VoxelsPerBrick / 4;                 // 128
 
     /// <summary>Edge length of a single voxel, in metres.</summary>
-    public const float VoxelSize = 0.05f;
+    public const float VoxelSize = 0.02f;
 
     /// <summary>Index entry meaning "nothing here" — no pool storage.</summary>
     public const uint EntryEmpty = 0u;

@@ -50,7 +50,7 @@ uniform float uPointStrength;   // intensity; also gates whether a surface is li
 
 const int   B            = 8;          // voxels per brick edge
 const uint  UNIFORM_FLAG = 0x80000000u;
-const float FOG_DENSITY  = 0.00006;    // per voxel of distance; light enough to see far terrain
+const float FOG_DENSITY  = 0.00004;    // per voxel of distance; light enough to see far terrain
 const float SHADOW_RANGE = 2500.0;     // voxels; long enough for terrain to shade itself
 const float POINT_FALLOFF = 0.0030;    // inverse-square attenuation scale (per voxel^2)
 const float POINT_MIN     = 0.03;      // below this, a surface receives no meaningful light
@@ -518,8 +518,9 @@ bool traceOneShape(int i, vec3 ro, vec3 rd, float tMax, out float outT, out vec3
     vec3 n = vec3(lessThanEqual(tmin3.yzx, tmin3.xyz)) * vec3(lessThanEqual(tmin3.zxy, tmin3.xyz));
     n *= -sgn;
 
-    // Cap covers the long axis of the biggest shape (a few hundred voxels).
-    for (int k = 0; k < 512; k++)
+    // Cap covers the long axis of the biggest shape in voxels; at 2 cm the 8 m beam
+    // spans ~400 voxels and its rotated AABB corridor is longer still.
+    for (int k = 0; k < 2048; k++)
     {
         if (t > tStop) return false;
         if (insideDynShape(i, vec3(v) + 0.5)) { outT = t; outN = n; outVox = v; return true; }

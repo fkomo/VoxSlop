@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Numerics;
+using System.Threading;
 
 namespace VoxSlop.App.Voxels;
 
@@ -30,6 +31,7 @@ public static class WorldGen
     {
         var sw = Stopwatch.StartNew();
         var world = new VoxelWorld(brickDimX, brickDimY, brickDimZ);
+        Console.WriteLine("Generating world...");
 
         int[] height = BuildHeightmap(world, seed, addTerrainNoise);
         Shape[] shapes = BuildShapes(world, height, seed);
@@ -39,6 +41,7 @@ public static class WorldGen
         var kind = new byte[brickCount];      // 0 = empty, 1 = uniform, 2 = partial
         var uniformMat = new byte[brickCount];
 
+        int classified = 0, classifyStep = Math.Max(1, brickDimZ / 100);
         Parallel.For(0, brickDimZ, bz =>
         {
             for (int by = 0; by < brickDimY; by++)
@@ -62,7 +65,11 @@ public static class WorldGen
                 else
                     kind[bi] = 2;                       // straddles the surface or a material band
             }
+
+            int d = Interlocked.Increment(ref classified);
+            if (d % classifyStep == 0 || d == brickDimZ) PrintProgress("Classifying bricks", d, brickDimZ);
         });
+        FinishProgress();
 
         // Pass 2 — assign pool slots. Serial, but it is a single linear scan.
         int allocated = 0;
@@ -86,6 +93,7 @@ public static class WorldGen
         // Pass 3 — fill only the bricks that earned storage.
         int strideY = brickDimX;
         int strideZ = brickDimX * brickDimY;
+        int filled = 0, fillStep = Math.Max(1, allocated / 100);
         Parallel.For(0, allocated, slot =>
         {
             int bi = partialBricks[slot];
@@ -106,7 +114,11 @@ public static class WorldGen
                 if (m != Materials.Air)
                     world.WritePoolVoxel(slot, VoxelWorld.LocalVoxelIndex(lx, ly, lz), m);
             }
+
+            int d = Interlocked.Increment(ref filled);
+            if (d % fillStep == 0 || d == allocated) PrintProgress("Filling bricks", d, allocated);
         });
+        FinishProgress();
 
         // Pass 4 — reclaim slots that turned out uniform after all. Classification
         // is deliberately conservative (it can only reason about the heightfield),
@@ -248,6 +260,7 @@ public static class WorldGen
         // Only this fraction of columns get a tuft at all; the rest stay flat.
         const uint TuftChance = (uint)(0.18f * uint.MaxValue);
 
+        int done = 0, step = Math.Max(1, dimZ / 100);
         Parallel.For(0, dimZ, z =>
         {
             for (int x = 0; x < dimX; x++)
@@ -268,10 +281,20 @@ public static class WorldGen
 
                 height[x + dimX * z] = h;
             }
+
+            int d = Interlocked.Increment(ref done);
+            if (d % step == 0 || d == dimZ) PrintProgress("Heightmap", d, dimZ);
         });
+        FinishProgress();
 
         return height;
     }
+
+    /// <summary>Overwrites one console line with a phase percentage. Safe to call from threads.</summary>
+    private static void PrintProgress(string phase, int done, int total) =>
+        Console.Write($"\r  {phase,-18} {100.0 * done / total,3:0}%");
+
+    private static void FinishProgress() => Console.WriteLine();
 
     /// <summary>Deterministic per-column hash used for the rough-grass scatter.</summary>
     private static uint ColumnHash(int x, int z, int seed)

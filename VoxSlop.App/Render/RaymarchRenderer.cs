@@ -44,10 +44,10 @@ public sealed class RaymarchRenderer : IDisposable
 
     /// <summary>
     /// Cap on brick-level DDA steps; the practical view distance limiter. A ray can
-    /// cross up to dimX+dimY+dimZ bricks (~2100 at 1024x48x1024) before leaving the
+    /// cross up to dimX+dimY+dimZ bricks (~1600 at 640x320x640) before leaving the
     /// grid, so anything less clips distant terrain away mid-ray.
     /// </summary>
-    public int MaxBrickSteps { get; set; } = 2200;
+    public int MaxBrickSteps { get; set; } = 1700;
 
     public Vector3 SunDirection { get; set; } = Vector3.Normalize(new Vector3(0.45f, 0.72f, 0.28f));
 
@@ -155,13 +155,21 @@ public sealed class RaymarchRenderer : IDisposable
 
     private uint UploadStorage(uint binding, uint[] data, BufferUsageARB usage = BufferUsageARB.StaticDraw)
     {
+        // 64-bit byte count: at high resolution the pool exceeds 2 GB, and
+        // (int * int) here would silently overflow to a garbage buffer size.
+        nuint bytes = (nuint)data.Length * sizeof(uint);
+
+        const GetPName MaxShaderStorageBlockSize = (GetPName)0x90DE;
+        _gl.GetInteger(MaxShaderStorageBlockSize, out int maxBlock);
+        if (maxBlock > 0 && bytes > (nuint)maxBlock)
+            Console.WriteLine(
+                $"WARNING: SSBO binding {binding} needs {bytes / (1024 * 1024)} MB but the driver caps " +
+                $"shader storage blocks at {maxBlock / (1024 * 1024)} MB. The world is too big for this GPU " +
+                $"at the current voxel size -- expect missing/corrupt geometry. Reduce the world size or voxel count.");
+
         uint buffer = _gl.GenBuffer();
         _gl.BindBuffer(BufferTargetARB.ShaderStorageBuffer, buffer);
-        _gl.BufferData<uint>(
-            BufferTargetARB.ShaderStorageBuffer,
-            (nuint)(data.Length * sizeof(uint)),
-            new ReadOnlySpan<uint>(data),
-            usage);
+        _gl.BufferData<uint>(BufferTargetARB.ShaderStorageBuffer, bytes, new ReadOnlySpan<uint>(data), usage);
         _gl.BindBufferBase(BufferTargetARB.ShaderStorageBuffer, binding, buffer);
         return buffer;
     }

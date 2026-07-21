@@ -11,12 +11,13 @@ namespace VoxSlop.App.Engine;
 /// <summary>Owns the window, the world and the render loop.</summary>
 public sealed class Game : IDisposable
 {
-    // 1024 x 48 x 1024 bricks of 8 voxels at 5 cm = 8192 x 384 x 8192 voxels,
-    // i.e. a ~410 x 19 x 410 m landscape. Y is only as tall as the terrain plus
-    // headroom; the dense brick index costs 4 bytes per brick over the whole volume.
-    private const int BrickDimX = 1024;
-    private const int BrickDimY = 48;
-    private const int BrickDimZ = 1024;
+    // 640 x 320 x 640 bricks of 8 voxels at 2 cm = 5120 x 2560 x 5120 voxels,
+    // i.e. a ~102 x 51 x 102 m world. The brick index is dense over the whole
+    // volume at 4 bytes/brick, so the tall (mostly-empty) headroom costs VRAM: the
+    // index alone is ~500 MB here. The surface pool is unaffected by height.
+    private const int BrickDimX = 640;
+    private const int BrickDimY = 320;
+    private const int BrickDimZ = 640;
     private const int Seed = 1337;
 
     // Scatter single +1 voxels on the surface for a rougher, tuftier grass look.
@@ -65,8 +66,9 @@ public sealed class Game : IDisposable
     private int _pointColorIndex;
     private static readonly Vector3[] PointColors =
     [
+        new(0.0f, 0.00f, 0.80f), // blue
         //new(1.0f, 0.25f, 0.20f), // red
-        new(1.0f, 0.55f, 0.15f), // orange
+        //new(1.0f, 0.55f, 0.15f), // orange
         //new(1.0f, 0.95f, 0.30f), // yellow
         //new(0.30f, 1.0f, 0.35f), // green
         //new(0.25f, 0.8f, 1.0f),  // cyan
