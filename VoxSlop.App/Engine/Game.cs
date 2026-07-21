@@ -19,6 +19,9 @@ public sealed class Game : IDisposable
     private const int BrickDimZ = 1024;
     private const int Seed = 1337;
 
+    // Scatter single +1 voxels on the surface for a rougher, tuftier grass look.
+    private const bool AddTerrainNoise = true;
+
     private readonly IWindow _window;
 
     private GL _gl = null!;
@@ -42,7 +45,7 @@ public sealed class Game : IDisposable
     // setting -X, then below the horizon for "night"), tilted slightly so it never
     // passes exactly overhead. Advances even when the cursor is released, and can
     // be paused with P.
-    private const float SunSpeed = 0.15f; // radians per second, ~42 s per full circle
+    private const float SunSpeed = 0.05f; // radians per second, ~42 s per full circle
     private float _sunAngle = 0.6f;       // start mid-morning
     private bool _sunPaused;
 
@@ -104,7 +107,7 @@ public sealed class Game : IDisposable
         // Cache the generated world next to the executable; a matching cache is
         // loaded on later runs instead of regenerating from scratch.
         string cachePath = Path.Combine(AppContext.BaseDirectory, "world.voxcache");
-        _world = WorldStore.LoadOrGenerate(BrickDimX, BrickDimY, BrickDimZ, Seed, cachePath);
+        _world = WorldStore.LoadOrGenerate(BrickDimX, BrickDimY, BrickDimZ, Seed, AddTerrainNoise, cachePath);
 
         string shaderDir = Path.Combine(AppContext.BaseDirectory, "Render", "Shaders");
         _renderer = new RaymarchRenderer(_gl, _world, shaderDir);

@@ -24,19 +24,20 @@ public static class WorldStore
     /// generation itself changes (new/edited shapes), since the cache does not hash
     /// the generation code. Forces a rebuild.
     /// </summary>
-    private const int LayoutVersion = 5;
+    private const int LayoutVersion = 9;
 
     /// <summary>Loads a matching cached world, or generates a fresh one and caches it.</summary>
-    public static VoxelWorld LoadOrGenerate(int brickDimX, int brickDimY, int brickDimZ, int seed, string path)
+    public static VoxelWorld LoadOrGenerate(int brickDimX, int brickDimY, int brickDimZ, int seed,
+                                            bool addTerrainNoise, string path)
     {
-        if (TryLoad(brickDimX, brickDimY, brickDimZ, seed, path, out VoxelWorld? world))
+        if (TryLoad(brickDimX, brickDimY, brickDimZ, seed, addTerrainNoise, path, out VoxelWorld? world))
             return world!;
 
-        world = WorldGen.Generate(brickDimX, brickDimY, brickDimZ, seed);
+        world = WorldGen.Generate(brickDimX, brickDimY, brickDimZ, seed, addTerrainNoise);
 
         try
         {
-            Save(world, seed, path);
+            Save(world, seed, addTerrainNoise, path);
         }
         catch (Exception ex)
         {
@@ -47,7 +48,7 @@ public static class WorldStore
         return world;
     }
 
-    public static void Save(VoxelWorld world, int seed, string path)
+    public static void Save(VoxelWorld world, int seed, bool addTerrainNoise, string path)
     {
         var sw = Stopwatch.StartNew();
 
@@ -68,6 +69,7 @@ public static class WorldStore
             bw.Write(world.BrickDimX);
             bw.Write(world.BrickDimY);
             bw.Write(world.BrickDimZ);
+            bw.Write(addTerrainNoise);
             bw.Write((long)world.Index.Length);
             bw.Write((long)world.Pool.Length);
             bw.Flush();
@@ -88,7 +90,8 @@ public static class WorldStore
     /// Returns false (and regenerates nothing) if the file is missing, unreadable,
     /// or describes a different world.
     /// </summary>
-    public static bool TryLoad(int brickDimX, int brickDimY, int brickDimZ, int seed, string path, out VoxelWorld? world)
+    public static bool TryLoad(int brickDimX, int brickDimY, int brickDimZ, int seed,
+                               bool addTerrainNoise, string path, out VoxelWorld? world)
     {
         world = null;
         if (!File.Exists(path)) return false;
@@ -106,6 +109,7 @@ public static class WorldStore
             if (br.ReadInt32() != seed) return Reject(path, "seed changed");
             if (br.ReadInt32() != brickDimX || br.ReadInt32() != brickDimY || br.ReadInt32() != brickDimZ)
                 return Reject(path, "grid dimensions changed");
+            if (br.ReadBoolean() != addTerrainNoise) return Reject(path, "terrain-noise flag changed");
 
             long indexLen = br.ReadInt64();
             long poolLen = br.ReadInt64();

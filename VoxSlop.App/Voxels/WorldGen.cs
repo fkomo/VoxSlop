@@ -25,12 +25,13 @@ public static class WorldGen
     private const int GrassDepth = 2;   // 2 cm of grass
     private const int DirtDepth = 10;   // then 8 cm of dirt, stone below
 
-    public static VoxelWorld Generate(int brickDimX, int brickDimY, int brickDimZ, int seed)
+    public static VoxelWorld Generate(int brickDimX, int brickDimY, int brickDimZ, int seed,
+                                      bool addTerrainNoise)
     {
         var sw = Stopwatch.StartNew();
         var world = new VoxelWorld(brickDimX, brickDimY, brickDimZ);
 
-        int[] height = BuildHeightmap(world, seed);
+        int[] height = BuildHeightmap(world, seed, addTerrainNoise);
         Shape[] shapes = BuildShapes(world, height, seed);
 
         // Pass 1 — classify each brick without touching individual voxels where possible.
@@ -226,7 +227,7 @@ public static class WorldGen
         return false;
     }
 
-    private static int[] BuildHeightmap(VoxelWorld world, int seed)
+    private static int[] BuildHeightmap(VoxelWorld world, int seed, bool addTerrainNoise)
     {
         int dimX = world.VoxelDimX, dimZ = world.VoxelDimZ;
         var height = new int[dimX * dimZ];
@@ -238,18 +239,46 @@ public static class WorldGen
         const float Amplitude = 160f;    // voxels
         const float FeatureSize = 1400f; // voxels per noise cell at the base octave
 
+        // Short-wavelength wobble added before rounding. It barely changes the
+        // overall shape but shifts where each integer step lands, so the contour
+        // lines between height levels turn ragged instead of clean and artificial.
+        const float EdgeSize = 22f;      // voxels per noise cell (~1.1 m wobble)
+        const float EdgeAmplitude = 3.0f; // voxels the step boundary can shift by
+
+        // Only this fraction of columns get a tuft at all; the rest stay flat.
+        const uint TuftChance = (uint)(0.18f * uint.MaxValue);
+
         Parallel.For(0, dimZ, z =>
         {
             for (int x = 0; x < dimX; x++)
             {
-                // Only 3 octaves, so there is little high-frequency detail to make
-                // the surface look wavy; the base octave carries most of the shape.
+                // Broad base shape.
                 float n = Noise.Fbm(x / FeatureSize, z / FeatureSize, seed, octaves: 5);
-                height[x + dimX * z] = (int)MathF.Round(BaseHeight + n * Amplitude);
+                float hf = BaseHeight + n * Amplitude;
+
+                // Break up the clean step boundaries with a little high-frequency noise.
+                float edge = Noise.Fbm(x / EdgeSize, z / EdgeSize, seed + 4242, octaves: 3) - 0.5f;
+                hf += edge * EdgeAmplitude;
+
+                int h = (int)MathF.Round(hf);
+
+                // Sparse tufts: most columns are flat, a few rise by 1 or 2 voxels.
+                uint hash = ColumnHash(x, z, seed);
+                if (addTerrainNoise && hash < TuftChance) h += 1 + (int)((hash >> 8) & 1u);
+
+                height[x + dimX * z] = h;
             }
         });
 
         return height;
+    }
+
+    /// <summary>Deterministic per-column hash used for the rough-grass scatter.</summary>
+    private static uint ColumnHash(int x, int z, int seed)
+    {
+        uint h = (uint)(x * 374761393 + z * 668265263 + seed * 2147483647);
+        h = (h ^ (h >> 13)) * 1274126177u;
+        return h ^ (h >> 16);
     }
 
     private static Shape[] BuildShapes(VoxelWorld world, int[] height, int seed)
