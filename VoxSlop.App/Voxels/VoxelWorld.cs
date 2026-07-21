@@ -21,6 +21,12 @@ public sealed class VoxelWorld
     /// <summary>Voxel materials are one byte, packed 4-per-uint for SSBO access.</summary>
     public const int UintsPerBrick = VoxelsPerBrick / 4;                 // 128
 
+    /// <summary>Mip: each brick is also downsampled to a 4^3 grid (each cell = 2^3 voxels)
+    /// for distance LOD. Derived from the pool, not stored in the cache.</summary>
+    public const int MipEdge = 4;
+    public const int MipCellsPerBrick = MipEdge * MipEdge * MipEdge;     // 64
+    public const int MipUintsPerBrick = MipCellsPerBrick / 4;            // 16
+
     /// <summary>Edge length of a single voxel, in metres.</summary>
     public const float VoxelSize = 0.02f;
 
@@ -47,6 +53,10 @@ public sealed class VoxelWorld
 
     /// <summary>Packed voxel payloads for partial bricks, <see cref="UintsPerBrick"/> uints each.</summary>
     public uint[] Pool { get; private set; } = [];
+
+    /// <summary>Downsampled 4^3 payload per stored brick (<see cref="MipUintsPerBrick"/> uints),
+    /// same slot indexing as <see cref="Pool"/>. Built by <see cref="BuildMips"/>.</summary>
+    public uint[] MipPool { get; private set; } = [];
 
     /// <summary>Number of bricks that needed real storage.</summary>
     public int AllocatedBricks => Pool.Length / UintsPerBrick;
@@ -77,6 +87,49 @@ public sealed class VoxelWorld
 
     public static int LocalVoxelIndex(int lx, int ly, int lz) =>
         lx + BrickEdge * (ly + BrickEdge * lz);
+
+    /// <summary>
+    /// Builds the mip pool by downsampling every stored brick's 8^3 payload to a
+    /// 4^3 grid. A mip cell (2^3 voxels) takes a representative material if at least
+    /// two of its eight voxels are solid, else air. Derived from <see cref="Pool"/>,
+    /// so it is recomputed after both generation and cache load rather than stored.
+    /// </summary>
+    public void BuildMips()
+    {
+        int slots = AllocatedBricks;
+        MipPool = new uint[(long)slots * MipUintsPerBrick];
+
+        System.Threading.Tasks.Parallel.For(0, slots, slot =>
+        {
+            int fullBase = slot * UintsPerBrick;
+            int mipBase = slot * MipUintsPerBrick;
+
+            for (int mz = 0; mz < MipEdge; mz++)
+            for (int my = 0; my < MipEdge; my++)
+            for (int mx = 0; mx < MipEdge; mx++)
+            {
+                int solid = 0, bestLy = -1;
+                byte mat = 0;
+                for (int dz = 0; dz < 2; dz++)
+                for (int dy = 0; dy < 2; dy++)
+                for (int dx = 0; dx < 2; dx++)
+                {
+                    int li = LocalVoxelIndex(mx * 2 + dx, my * 2 + dy, mz * 2 + dz);
+                    byte v = (byte)((Pool[fullBase + (li >> 2)] >> ((li & 3) * 8)) & 0xFF);
+                    if (v == 0) continue;
+                    solid++;
+                    int ly = my * 2 + dy;           // take the topmost solid -> the visible surface
+                    if (ly > bestLy) { bestLy = ly; mat = v; }
+                }
+
+                byte cell = solid >= 2 ? mat : (byte)0;
+                int idx = mx + MipEdge * (my + MipEdge * mz);
+                int word = mipBase + (idx >> 2);
+                int shift = (idx & 3) * 8;
+                MipPool[word] = (MipPool[word] & ~(0xFFu << shift)) | ((uint)cell << shift);
+            }
+        });
+    }
 
     /// <summary>Material at a voxel coordinate; 0 (air) outside the world.</summary>
     public byte GetVoxel(int vx, int vy, int vz)

@@ -11,6 +11,10 @@ out vec4 FragColor;
 layout(std430, binding = 0) readonly buffer BrickIndex { uint bricks[]; };
 layout(std430, binding = 1) readonly buffer VoxelPool  { uint voxels[]; };
 
+// Distance LOD: each stored brick also has a 4^3 (16-uint) downsample. Far bricks
+// trace this instead of the full 8^3 grid, so sub-pixel voxels stop shimmering.
+layout(std430, binding = 4) readonly buffer MipPool { uint mipVoxels[]; };
+
 // Per-voxel-face shadow cache. One slot holds (keyLo, keyHi, epoch, lightBits).
 // coherent so writes from earlier draws are visible to later ones after a barrier.
 layout(std430, binding = 2) coherent buffer ShadowCache { uvec4 shadowCache[]; };
@@ -34,6 +38,7 @@ uniform vec3  uCamUp;
 uniform vec3  uCamForward;
 uniform vec2  uResolution;
 uniform float uTanHalfFov;
+uniform vec2  uJitter;       // sub-pixel NDC offset for TAA (zero when disabled)
 uniform vec3  uSunDir;       // normalised, points toward the sun
 uniform int   uShadows;
 uniform int   uMaxBrickSteps;
@@ -64,6 +69,15 @@ uint voxelAt(uint slot, ivec3 lv)
 {
     uint li = uint(lv.x + B * (lv.y + B * lv.z));   // 0..511
     uint word = voxels[slot * 128u + (li >> 2)];
+    return (word >> ((li & 3u) * 8u)) & 0xFFu;
+}
+
+const int MB = 4;   // mip cells per brick edge (each cell = 2 voxels)
+
+uint mipAt(uint slot, ivec3 mc)
+{
+    uint li = uint(mc.x + MB * (mc.y + MB * mc.z));  // 0..63
+    uint word = mipVoxels[slot * 16u + (li >> 2)];
     return (word >> ((li & 3u) * 8u)) & 0xFFu;
 }
 
@@ -99,33 +113,38 @@ float valueNoise(vec3 p)
 }
 
 // Grass gets three scales of variation stacked on top of each other: broad
-// patches of dry-vs-lush, smaller tufts inside those, and a per-voxel speckle.
-// Without the coarse layers a purely per-voxel hash just reads as TV static.
-vec3 grassColor(ivec3 v)
+// patches of dry-vs-lush, smaller clumps inside those, and a per-voxel speckle.
+// `detail` (1 near, 0 far) fades the highest-frequency terms so that distant,
+// sub-pixel voxels stop sparkling.
+vec3 grassColor(ivec3 v, float detail)
 {
     // Note: "patch" is a reserved word in GLSL 4.x (tessellation), hence "meadow".
-    float meadow = valueNoise(vec3(v) / 130.0);   // ~6.5 m at 5 cm voxels
-    float clump  = valueNoise(vec3(v) / 26.0);    // ~1.3 m
-    float speck  = hashCell(v);                   // one voxel
+    float meadow = valueNoise(vec3(v) / 90.0);    // broad dry/lush patches
+    float clump  = valueNoise(vec3(v) / 18.0);    // knee-high clumps
+    float speck  = mix(0.5, hashCell(v), detail); // per-voxel; fades to its mean far off
 
-    float t = clamp(meadow * 0.52 + clump * 0.33 + speck * 0.15, 0.0, 1.0);
+    float t = clamp(meadow * 0.55 + clump * 0.33 + speck * 0.12, 0.0, 1.0);
 
-    const vec3 DRY  = vec3(0.47, 0.50, 0.19);     // sun-bleached yellow-green
-    const vec3 MID  = vec3(0.25, 0.47, 0.17);
-    const vec3 LUSH = vec3(0.11, 0.30, 0.12);     // deep shaded green
+    // Warm straw tips -> fresh blade green -> cool deep shade.
+    const vec3 DRY  = vec3(0.53, 0.54, 0.24);
+    const vec3 MID  = vec3(0.27, 0.47, 0.16);
+    const vec3 LUSH = vec3(0.12, 0.31, 0.13);
 
     vec3 c = t < 0.5 ? mix(DRY, MID, t * 2.0) : mix(MID, LUSH, (t - 0.5) * 2.0);
 
-    // Independent value jitter, so neighbouring voxels of similar hue still
-    // separate from each other at close range.
-    c *= 0.86 + 0.28 * hashCell(v + ivec3(17, 0, 41));
+    // A touch of blue-green in the lushest patches reads as shaded blades.
+    c = mix(c, c * vec3(0.82, 1.0, 0.92), smoothstep(0.55, 1.0, t) * 0.6);
+
+    // Gentle per-voxel value jitter -- the main shimmer source, so fade it with distance.
+    c *= mix(1.0, 0.93 + 0.14 * hashCell(v + ivec3(17, 0, 41)), detail);
 
     return c;
 }
 
-vec3 surfaceColor(uint m, ivec3 v, vec3 n)
+vec3 surfaceColor(uint m, ivec3 v, float detail)
 {
-    if (m == 1u) return grassColor(v);
+    if (m == 1u) return grassColor(v, detail) * 0.68;   // ground grass, darker
+    if (m == 6u) return grassColor(v, detail) * 1.30;   // raised tufts, lighter
 
     vec3 base;
     if      (m == 2u) base = vec3(0.42, 0.30, 0.18);   // dirt
@@ -134,8 +153,16 @@ vec3 surfaceColor(uint m, ivec3 v, vec3 n)
     else if (m == 5u) base = vec3(0.83, 0.42, 0.14);   // rust
     else              base = vec3(1.0, 0.0, 1.0);      // unknown material
 
-    // Mild grain, enough to keep flat areas from reading as untextured plastic.
-    return base * (0.90 + 0.20 * hashCell(v));
+    // Mild grain up close, faded out where voxels go sub-pixel.
+    return base * mix(1.0, 0.90 + 0.20 * hashCell(v), detail);
+}
+
+// Detail LOD in [0,1]: 1 where a voxel is at least ~1 pixel wide, falling to 0 as
+// voxels shrink below pixel size with distance. `dist` is in voxel units.
+float detailAt(float dist)
+{
+    float subpixel = uResolution.y / (2.0 * uTanHalfFov); // distance where a voxel ~= 1 px
+    return 1.0 - smoothstep(subpixel, subpixel * 4.0, dist);
 }
 
 bool intersectGrid(vec3 ro, vec3 rd, vec3 bmax, out float t0, out float t1, out vec3 entryNormal)
@@ -193,6 +220,15 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
 
     vec3 deltaVoxel = abs(1.0 / rd);
 
+    // Beyond ~this distance (voxel units) a fine voxel is under ~1 pixel, so partial
+    // bricks trace the 4^3 mip instead of the full 8^3 grid to stop shimmering.
+    float mipDist = uResolution.y / (2.0 * uTanHalfFov);
+
+    // Dither the near/far switch across a band so it is a soft stipple rather than a
+    // hard ring. Interleaved-gradient noise keyed on the pixel gives a stable, even
+    // pattern; near and far look nearly identical in the band so the stipple is faint.
+    float mipDither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+
     for (int step = 0; step < uMaxBrickSteps; step++)
     {
         uint entry = brickAt(bc);
@@ -208,55 +244,110 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                 return true;
             }
 
-            // Partial brick -- run a voxel DDA confined to its 8^3 interior.
+            // Partial brick. Near: full 8^3 DDA. Far: the 4^3 mip (cell = 2 voxels)
+            // so sub-pixel voxels resolve to stable 4 cm cells instead of shimmering.
             uint slot = entry - 1u;
             vec3  base = vec3(bc * B);
             vec3  p    = ro + rd * (t + 1e-3);
-            ivec3 lv   = clamp(ivec3(floor(p - base)), ivec3(0), ivec3(B - 1));
 
-            vec3 nextVoxel;
-            for (int i = 0; i < 3; i++)
+            // Probability of using the mip ramps from 0 to 1 across the transition band.
+            float lodFrac = smoothstep(mipDist * 0.7, mipDist * 1.9, t);
+            if (mipDither < lodFrac)
             {
-                float bound = float(lv[i]) + (sgn[i] > 0.0 ? 1.0 : 0.0);
-                nextVoxel[i] = (rd[i] == 0.0) ? 1e30 : (base[i] + bound - ro[i]) / rd[i];
+                ivec3 mc = clamp(ivec3(floor((p - base) * 0.5)), ivec3(0), ivec3(MB - 1));
+
+                vec3 nextCell;
+                for (int i = 0; i < 3; i++)
+                {
+                    float bound = float(mc[i]) + (sgn[i] > 0.0 ? 1.0 : 0.0);
+                    nextCell[i] = (rd[i] == 0.0) ? 1e30 : (base[i] + bound * 2.0 - ro[i]) / rd[i];
+                }
+                vec3 deltaCell = abs(2.0 / rd);
+                float tv = t;
+                vec3  nv = normal;
+
+                for (int k = 0; k < 3 * MB; k++)
+                {
+                    uint m = mipAt(slot, mc);
+                    if (m != 0u)
+                    {
+                        hit.t = tv;
+                        hit.normal = nv;
+                        hit.material = m;
+                        hit.voxel = bc * B + mc * 2;
+                        return true;
+                    }
+
+                    if (nextCell.x < nextCell.y && nextCell.x < nextCell.z)
+                    {
+                        tv = nextCell.x; nextCell.x += deltaCell.x;
+                        mc.x += istep.x;  nv = vec3(-sgn.x, 0.0, 0.0);
+                        if (mc.x < 0 || mc.x >= MB) break;
+                    }
+                    else if (nextCell.y < nextCell.z)
+                    {
+                        tv = nextCell.y; nextCell.y += deltaCell.y;
+                        mc.y += istep.y;  nv = vec3(0.0, -sgn.y, 0.0);
+                        if (mc.y < 0 || mc.y >= MB) break;
+                    }
+                    else
+                    {
+                        tv = nextCell.z; nextCell.z += deltaCell.z;
+                        mc.z += istep.z;  nv = vec3(0.0, 0.0, -sgn.z);
+                        if (mc.z < 0 || mc.z >= MB) break;
+                    }
+
+                    if (tv > t1) return false;
+                }
             }
-
-            float tv = t;
-            vec3  nv = normal;
-
-            // A ray can cross at most 3*(B-1)+1 voxels of one brick.
-            for (int k = 0; k < 3 * B; k++)
+            else
             {
-                uint m = voxelAt(slot, lv);
-                if (m != 0u)
+                ivec3 lv = clamp(ivec3(floor(p - base)), ivec3(0), ivec3(B - 1));
+
+                vec3 nextVoxel;
+                for (int i = 0; i < 3; i++)
                 {
-                    hit.t = tv;
-                    hit.normal = nv;
-                    hit.material = m;
-                    hit.voxel = bc * B + lv;
-                    return true;
+                    float bound = float(lv[i]) + (sgn[i] > 0.0 ? 1.0 : 0.0);
+                    nextVoxel[i] = (rd[i] == 0.0) ? 1e30 : (base[i] + bound - ro[i]) / rd[i];
                 }
 
-                if (nextVoxel.x < nextVoxel.y && nextVoxel.x < nextVoxel.z)
-                {
-                    tv = nextVoxel.x; nextVoxel.x += deltaVoxel.x;
-                    lv.x += istep.x;  nv = vec3(-sgn.x, 0.0, 0.0);
-                    if (lv.x < 0 || lv.x >= B) break;
-                }
-                else if (nextVoxel.y < nextVoxel.z)
-                {
-                    tv = nextVoxel.y; nextVoxel.y += deltaVoxel.y;
-                    lv.y += istep.y;  nv = vec3(0.0, -sgn.y, 0.0);
-                    if (lv.y < 0 || lv.y >= B) break;
-                }
-                else
-                {
-                    tv = nextVoxel.z; nextVoxel.z += deltaVoxel.z;
-                    lv.z += istep.z;  nv = vec3(0.0, 0.0, -sgn.z);
-                    if (lv.z < 0 || lv.z >= B) break;
-                }
+                float tv = t;
+                vec3  nv = normal;
 
-                if (tv > t1) return false;
+                // A ray can cross at most 3*(B-1)+1 voxels of one brick.
+                for (int k = 0; k < 3 * B; k++)
+                {
+                    uint m = voxelAt(slot, lv);
+                    if (m != 0u)
+                    {
+                        hit.t = tv;
+                        hit.normal = nv;
+                        hit.material = m;
+                        hit.voxel = bc * B + lv;
+                        return true;
+                    }
+
+                    if (nextVoxel.x < nextVoxel.y && nextVoxel.x < nextVoxel.z)
+                    {
+                        tv = nextVoxel.x; nextVoxel.x += deltaVoxel.x;
+                        lv.x += istep.x;  nv = vec3(-sgn.x, 0.0, 0.0);
+                        if (lv.x < 0 || lv.x >= B) break;
+                    }
+                    else if (nextVoxel.y < nextVoxel.z)
+                    {
+                        tv = nextVoxel.y; nextVoxel.y += deltaVoxel.y;
+                        lv.y += istep.y;  nv = vec3(0.0, -sgn.y, 0.0);
+                        if (lv.y < 0 || lv.y >= B) break;
+                    }
+                    else
+                    {
+                        tv = nextVoxel.z; nextVoxel.z += deltaVoxel.z;
+                        lv.z += istep.z;  nv = vec3(0.0, 0.0, -sgn.z);
+                        if (lv.z < 0 || lv.z >= B) break;
+                    }
+
+                    if (tv > t1) return false;
+                }
             }
         }
 
@@ -599,7 +690,8 @@ float shapeSunFactor(ivec3 voxel, vec3 n)
 
 void main()
 {
-    vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0;
+    // uJitter is a sub-pixel NDC offset for temporal anti-aliasing (zero when off).
+    vec2 ndc = (gl_FragCoord.xy / uResolution) * 2.0 - 1.0 + uJitter;
     float aspect = uResolution.x / uResolution.y;
 
     vec3 rd = normalize(uCamForward
@@ -614,7 +706,7 @@ void main()
 
     if (hitWorld)
     {
-        vec3 albedo = surfaceColor(hit.material, hit.voxel, hit.normal);
+        vec3 albedo = surfaceColor(hit.material, hit.voxel, detailAt(hit.t));
 
         float ndl = max(dot(hit.normal, uSunDir), 0.0);
         // One shadow value for the whole voxel face, quantised to a coverage ratio.
@@ -644,7 +736,7 @@ void main()
     float shapeT; vec3 shapeN; ivec3 shapeV; vec3 shapeCol;
     if (uShapeCount > 0 && traceShapes(uCamPos, rd, worldT, shapeT, shapeN, shapeV, shapeCol))
     {
-        vec3 albedo = shapeCol * (0.90 + 0.20 * hashCell(shapeV));
+        vec3 albedo = shapeCol * mix(1.0, 0.90 + 0.20 * hashCell(shapeV), detailAt(shapeT));
         float ndl = max(dot(shapeN, uSunDir), 0.0);
         float shadow = 1.0;
         if (uShadows != 0 && ndl > 0.0)                // uncached: shapes move every frame
@@ -674,11 +766,9 @@ void main()
         color = mix(emissive, skyColor(rd), fog);
     }
 
-    // Crosshair, drawn straight into the frame -- no UI pass in this demo.
-    vec2 d = abs(gl_FragCoord.xy - uResolution * 0.5);
-    if ((d.x < 1.0 && d.y < 9.0) || (d.y < 1.0 && d.x < 9.0))
-        color = mix(color, vec3(1.0), 0.75);
-
     // Approximate sRGB output; the default framebuffer here is not sRGB-encoded.
-    FragColor = vec4(pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2)), 1.0);
+    // Alpha carries the scene depth (voxel units, -1 for sky) for TAA reprojection.
+    // The crosshair is drawn later by the present pass so TAA does not smear it.
+    float depth = (worldT > 1e29) ? -1.0 : worldT;
+    FragColor = vec4(pow(clamp(color, 0.0, 1.0), vec3(1.0 / 2.2)), depth);
 }

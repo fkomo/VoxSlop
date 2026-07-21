@@ -156,6 +156,8 @@ public sealed class Game : IDisposable
         Console.WriteLine("  P            pause / resume the sun");
         Console.WriteLine("  C            toggle per-voxel-face shadow cache");
         Console.WriteLine("  G            toggle the orbiting point light");
+        Console.WriteLine("  T            toggle temporal anti-aliasing (TAA)");
+        Console.WriteLine("  F11          toggle fullscreen");
         Console.WriteLine("  R            reload shaders from disk");
         Console.WriteLine("  Esc          release / recapture the cursor (click to recapture)");
         Console.WriteLine();
@@ -184,6 +186,14 @@ public sealed class Game : IDisposable
                 break;
             case Key.G:
                 _renderer.PointLightEnabled = !_renderer.PointLightEnabled;
+                break;
+            case Key.T:
+                _renderer.TaaEnabled = !_renderer.TaaEnabled;
+                break;
+            case Key.F11:
+                _window.WindowState = _window.WindowState == WindowState.Fullscreen
+                    ? WindowState.Normal
+                    : WindowState.Fullscreen;
                 break;
             case Key.R:
                 _renderer.TryReloadShaders();

@@ -12,6 +12,7 @@ public static class Materials
     public const byte Stone = 3;
     public const byte Concrete = 4;
     public const byte Rust = 5;
+    public const byte GrassTuft = 6; // the raised voxel tufts, coloured lighter than the ground
 }
 
 /// <summary>
@@ -33,7 +34,7 @@ public static class WorldGen
         var world = new VoxelWorld(brickDimX, brickDimY, brickDimZ);
         Console.WriteLine("Generating world...");
 
-        int[] height = BuildHeightmap(world, seed, addTerrainNoise);
+        int[] height = BuildHeightmap(world, seed, addTerrainNoise, out byte[] tuft);
         Shape[] shapes = BuildShapes(world, height, seed);
 
         // Pass 1 — classify each brick without touching individual voxels where possible.
@@ -109,7 +110,7 @@ public static class WorldGen
                     bx * VoxelWorld.BrickEdge + lx,
                     by * VoxelWorld.BrickEdge + ly,
                     bz * VoxelWorld.BrickEdge + lz,
-                    height, world.VoxelDimX, shapes);
+                    height, tuft, world.VoxelDimX, shapes);
 
                 if (m != Materials.Air)
                     world.WritePoolVoxel(slot, VoxelWorld.LocalVoxelIndex(lx, ly, lz), m);
@@ -125,6 +126,7 @@ public static class WorldGen
         // so a large share of the material-band and shape-adjacent bricks end up
         // holding a single repeated value. On a 40 m map this is worth hundreds of MB.
         int kept = CompactPool(world, partialBricks);
+        world.BuildMips(); // 4^3 LOD payloads, derived from the compacted pool
 
         long totalSlots = (long)world.VoxelDimX * world.VoxelDimY * world.VoxelDimZ;
         double indexMb = world.Index.Length * 4.0 / (1024 * 1024);
@@ -197,16 +199,24 @@ public static class WorldGen
     }
 
     /// <summary>Material at a voxel: heightfield first, then shapes stamped over it in order.</summary>
-    private static byte SampleVoxel(int vx, int vy, int vz, int[] height, int dimX, Shape[] shapes)
+    private static byte SampleVoxel(int vx, int vy, int vz, int[] height, byte[] tuft, int dimX, Shape[] shapes)
     {
-        int h = height[vx + dimX * vz];
+        int col = vx + dimX * vz;
+        int h = height[col];
         byte m = Materials.Air;
         if (vy < h)
         {
             int depth = h - 1 - vy;
-            m = depth < GrassDepth ? Materials.Grass
-              : depth < DirtDepth ? Materials.Dirt
-              : Materials.Stone;
+            int t = tuft[col];
+            if (depth < t)
+                m = Materials.GrassTuft;                 // the raised tuft voxels
+            else
+            {
+                int baseDepth = depth - t;               // depth below the base (untufted) surface
+                m = baseDepth < GrassDepth ? Materials.Grass
+                  : baseDepth < DirtDepth ? Materials.Dirt
+                  : Materials.Stone;
+            }
         }
 
         foreach (var s in shapes)
@@ -239,10 +249,11 @@ public static class WorldGen
         return false;
     }
 
-    private static int[] BuildHeightmap(VoxelWorld world, int seed, bool addTerrainNoise)
+    private static int[] BuildHeightmap(VoxelWorld world, int seed, bool addTerrainNoise, out byte[] tuft)
     {
         int dimX = world.VoxelDimX, dimZ = world.VoxelDimZ;
         var height = new int[dimX * dimZ];
+        var tuftLocal = new byte[dimX * dimZ];
 
         // Gently rolling ground: terrain spans roughly 0.8 m to 2.4 m inside the
         // 5.12 m tall world. Large feature size + few octaves keeps the relief
@@ -258,7 +269,7 @@ public static class WorldGen
         const float EdgeAmplitude = 3.0f; // voxels the step boundary can shift by
 
         // Only this fraction of columns get a tuft at all; the rest stay flat.
-        const uint TuftChance = (uint)(0.18f * uint.MaxValue);
+        const uint TuftChance = (uint)(0.33f * uint.MaxValue);
 
         int done = 0, step = Math.Max(1, dimZ / 100);
         Parallel.For(0, dimZ, z =>
@@ -275,11 +286,13 @@ public static class WorldGen
 
                 int h = (int)MathF.Round(hf);
 
-                // Sparse tufts: most columns are flat, a few rise by 1 or 2 voxels.
+                // Sparse tufts: most columns are flat, a few rise by few voxels.
                 uint hash = ColumnHash(x, z, seed);
-                if (addTerrainNoise && hash < TuftChance) h += 1 + (int)((hash >> 8) & 1u);
+                int bump = (addTerrainNoise && hash < TuftChance) ? 1 + (int)((hash >> 8) & 1u) : 0;
+                h += bump;
 
                 height[x + dimX * z] = h;
+                tuftLocal[x + dimX * z] = (byte)bump;
             }
 
             int d = Interlocked.Increment(ref done);
@@ -287,6 +300,7 @@ public static class WorldGen
         });
         FinishProgress();
 
+        tuft = tuftLocal;
         return height;
     }
 
