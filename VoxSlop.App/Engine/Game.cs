@@ -39,6 +39,10 @@ public sealed class Game : IDisposable
     private Vector2? _lastMousePosition;
     private bool _mouseCaptured;
 
+    // Borderless (windowed) fullscreen state, restored when toggled back.
+    private bool _borderless;
+    private Vector2D<int> _savedSize, _savedPos;
+
     private double _titleTimer;
     private int _framesSinceTitle;
 
@@ -153,11 +157,12 @@ public sealed class Game : IDisposable
         Console.WriteLine("  Space        jump / fly up          Ctrl  fly down");
         Console.WriteLine("  F            toggle walk / noclip");
         Console.WriteLine("  L            toggle sun shadows");
+        Console.WriteLine("  O            toggle ambient occlusion");
         Console.WriteLine("  P            pause / resume the sun");
         Console.WriteLine("  C            toggle per-voxel-face shadow cache");
         Console.WriteLine("  G            toggle the orbiting point light");
         Console.WriteLine("  T            toggle temporal anti-aliasing (TAA)");
-        Console.WriteLine("  F11          toggle fullscreen");
+        Console.WriteLine("  F11          toggle borderless fullscreen");
         Console.WriteLine("  R            reload shaders from disk");
         Console.WriteLine("  Esc          release / recapture the cursor (click to recapture)");
         Console.WriteLine();
@@ -176,6 +181,9 @@ public sealed class Game : IDisposable
             case Key.L:
                 _renderer.Shadows = !_renderer.Shadows;
                 break;
+            case Key.O:
+                _renderer.AmbientOcclusion = !_renderer.AmbientOcclusion;
+                break;
             case Key.P:
                 _sunPaused = !_sunPaused;
                 break;
@@ -191,13 +199,36 @@ public sealed class Game : IDisposable
                 _renderer.TaaEnabled = !_renderer.TaaEnabled;
                 break;
             case Key.F11:
-                _window.WindowState = _window.WindowState == WindowState.Fullscreen
-                    ? WindowState.Normal
-                    : WindowState.Fullscreen;
+                ToggleBorderlessFullscreen();
                 break;
             case Key.R:
                 _renderer.TryReloadShaders();
                 break;
+        }
+    }
+
+    // Borderless windowed fullscreen: a hidden-border window sized to the monitor,
+    // rather than an exclusive-fullscreen video mode change (which alt-tabs poorly).
+    private void ToggleBorderlessFullscreen()
+    {
+        if (!_borderless)
+        {
+            _savedSize = _window.Size;
+            _savedPos = _window.Position;
+            if (_window.Monitor is { } monitor)
+            {
+                _window.WindowBorder = WindowBorder.Hidden;
+                _window.Position = monitor.Bounds.Origin;
+                _window.Size = monitor.Bounds.Size;
+                _borderless = true;
+            }
+        }
+        else
+        {
+            _window.WindowBorder = WindowBorder.Resizable;
+            _window.Size = _savedSize;
+            _window.Position = _savedPos;
+            _borderless = false;
         }
     }
 

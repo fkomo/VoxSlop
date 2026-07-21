@@ -66,6 +66,8 @@ public sealed class RaymarchRenderer : IDisposable
 
     public bool Shadows { get; set; } = true;
 
+    public bool AmbientOcclusion { get; set; } = true;
+
     /// <summary>
     /// Cap on brick-level DDA steps; the practical view distance limiter. A ray can
     /// cross up to dimX+dimY+dimZ bricks (~1600 at 640x320x640) before leaving the
@@ -359,6 +361,7 @@ public sealed class RaymarchRenderer : IDisposable
         _shader.Set("uJitter", jitter.X, jitter.Y);
         _shader.Set("uSunDir", SunDirection);
         _shader.Set("uShadows", Shadows ? 1 : 0);
+        _shader.Set("uAo", AmbientOcclusion ? 1 : 0);
         _shader.Set("uMaxBrickSteps", MaxBrickSteps);
         _shader.Set("uShadowSamples", ShadowSamples);
         _shader.Set("uShadowCache", ShadowCache ? 1 : 0);

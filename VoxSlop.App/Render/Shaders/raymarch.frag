@@ -41,6 +41,7 @@ uniform float uTanHalfFov;
 uniform vec2  uJitter;       // sub-pixel NDC offset for TAA (zero when disabled)
 uniform vec3  uSunDir;       // normalised, points toward the sun
 uniform int   uShadows;
+uniform int   uAo;              // 0 = ambient occlusion off
 uniform int   uMaxBrickSteps;
 uniform int   uShadowSamples;   // sub-samples per axis across a voxel face (NxN)
 uniform int   uShadowCache;     // 0 = recompute per pixel, 1 = use the face cache
@@ -79,6 +80,16 @@ uint mipAt(uint slot, ivec3 mc)
     uint li = uint(mc.x + MB * (mc.y + MB * mc.z));  // 0..63
     uint word = mipVoxels[slot * 16u + (li >> 2)];
     return (word >> ((li & 3u) * 8u)) & 0xFFu;
+}
+
+// Direct solidity query for a world voxel (index -> pool), for ambient occlusion.
+bool solidAt(ivec3 v)
+{
+    if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, uBrickDims * B))) return false;
+    uint entry = brickAt(v >> 3);
+    if (entry == 0u) return false;
+    if ((entry & UNIFORM_FLAG) != 0u) return true;
+    return voxelAt(entry - 1u, v & 7) != 0u;
 }
 
 // Hash of an integer voxel cell, in [0,1]. Everything procedural here builds on it.
@@ -688,6 +699,40 @@ float shapeSunFactor(ivec3 voxel, vec3 n)
     return lit * (inv * inv);
 }
 
+// Classic voxel corner occlusion: at a face corner, count the two edge neighbours
+// and the diagonal neighbour in the air cell just off the face. Two solid edges
+// fully occlude the corner.
+float cornerAO(ivec3 air, ivec3 a1, ivec3 a2)
+{
+    float s1 = solidAt(air + a1) ? 1.0 : 0.0;
+    float s2 = solidAt(air + a2) ? 1.0 : 0.0;
+    if (s1 > 0.5 && s2 > 0.5) return 0.0;
+    float sc = solidAt(air + a1 + a2) ? 1.0 : 0.0;
+    return 1.0 - (s1 + s2 + sc) / 3.0;
+}
+
+// Ambient occlusion for a voxel face, in [0,1] (1 = open). Bilinearly interpolates
+// the four corner values by the hit position across the face, so edges round off.
+float faceAO(ivec3 hv, vec3 n, vec3 hitP)
+{
+    ivec3 ni = ivec3(round(n));
+    ivec3 t1, t2;
+    if      (abs(n.x) > 0.5) { t1 = ivec3(0, 1, 0); t2 = ivec3(0, 0, 1); }
+    else if (abs(n.y) > 0.5) { t1 = ivec3(1, 0, 0); t2 = ivec3(0, 0, 1); }
+    else                     { t1 = ivec3(1, 0, 0); t2 = ivec3(0, 1, 0); }
+
+    ivec3 air = hv + ni;   // empty cell just outside the face
+    float a00 = cornerAO(air, -t1, -t2);
+    float a10 = cornerAO(air,  t1, -t2);
+    float a01 = cornerAO(air, -t1,  t2);
+    float a11 = cornerAO(air,  t1,  t2);
+
+    vec3 local = hitP - vec3(hv);
+    float fu = clamp(dot(local, vec3(t1)), 0.0, 1.0);
+    float fv = clamp(dot(local, vec3(t2)), 0.0, 1.0);
+    return mix(mix(a00, a10, fu), mix(a01, a11, fu), fv);
+}
+
 void main()
 {
     // uJitter is a sub-pixel NDC offset for temporal anti-aliasing (zero when off).
@@ -715,9 +760,17 @@ void main()
         if (uShadows != 0 && ndl > 0.0)
             shadow = faceShadow(hit.voxel, hit.normal) * shapeSunFactor(hit.voxel, hit.normal);
 
+        // Ambient occlusion darkens crevices. Geometry-based, so it is independent of
+        // the sun and stacks under the hard shadow. Skipped far off (invisible there,
+        // and mip hits have no fine neighbourhood).
+        float ao = 1.0;
+        if (uAo != 0 && detailAt(hit.t) > 0.01)
+            ao = faceAO(hit.voxel, hit.normal, uCamPos + rd * hit.t);
+        float aoFactor = 0.35 + 0.65 * ao;   // floor so corners are not pitch black
+
         // Sky-dominant ambient plus a weak bounce off the ground.
         vec3 ambient = mix(vec3(0.30, 0.34, 0.42), vec3(0.22, 0.20, 0.16), hit.normal.y * -0.5 + 0.5);
-        vec3 lit = albedo * (ambient + vec3(1.0, 0.95, 0.85) * ndl * shadow * 1.15);
+        vec3 lit = albedo * (ambient * aoFactor + vec3(1.0, 0.95, 0.85) * ndl * shadow * 1.15);
 
         // Add the orbiting point light on top of the sun/ambient.
         lit += albedo * pointLight(hit.voxel, hit.normal);

@@ -269,7 +269,7 @@ public static class WorldGen
         const float EdgeAmplitude = 3.0f; // voxels the step boundary can shift by
 
         // Only this fraction of columns get a tuft at all; the rest stay flat.
-        const uint TuftChance = (uint)(0.33f * uint.MaxValue);
+        const uint TuftChance = (uint)(0.5f * uint.MaxValue);
 
         int done = 0, step = Math.Max(1, dimZ / 100);
         Parallel.For(0, dimZ, z =>

@@ -30,7 +30,7 @@ void main()
 
     if (uReset != 0)
     {
-        FragColor = vec4(cur, 1.0);
+        FragColor = vec4(cur, scene.a);   // seed depth for next frame's disocclusion test
         return;
     }
 
@@ -57,21 +57,49 @@ void main()
 
         if (all(greaterThanEqual(prevUv, vec2(0.0))) && all(lessThanEqual(prevUv, vec2(1.0))))
         {
-            // Colour AABB of the 3x3 current neighbourhood, used to clamp history.
+            // Neighbourhood mean and variance -> a tight colour box to clip history to.
+            // Variance clipping rejects stale (ghosting) history far better than a raw
+            // min/max box, which is what a moving light or a fast pan reveals.
             vec2 texel = 1.0 / uResolution;
-            vec3 lo = cur, hi = cur;
+            vec3 m1 = vec3(0.0), m2 = vec3(0.0);
             for (int j = -1; j <= 1; j++)
             for (int i = -1; i <= 1; i++)
             {
                 vec3 c = texture(uScene, uv + vec2(i, j) * texel).rgb;
-                lo = min(lo, c);
-                hi = max(hi, c);
+                m1 += c; m2 += c * c;
+            }
+            vec3 mean = m1 / 9.0;
+            vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, 0.0));
+            vec3 lo = mean - 1.25 * sigma;
+            vec3 hi = mean + 1.25 * sigma;
+
+            vec4 histSample = texture(uHistory, prevUv);
+            vec3 hist = clamp(histSample.rgb, lo, hi);
+
+            // Disocclusion: if the surface reprojected here was at a very different
+            // distance than what history holds, the history is suspect. Rather than a
+            // hard reset (which leaves a raw, aliased pixel that takes ~10 frames to
+            // re-converge, and false-fires along every silhouette), just distrust it:
+            // the variance clip above already tames the colour, and a moderate blend
+            // lets the pixel settle in a few frames. Genuine disocclusions converge
+            // fast this way instead of lingering as aliased edges.
+            float blend = clamp(uBlend, 0.0, 1.0);
+            bool curSky = scene.a < 0.0;
+            bool histSky = histSample.a < 0.0;
+            if (curSky != histSky)
+            {
+                blend = max(blend, 0.4);
+            }
+            else if (!curSky)
+            {
+                float expected = length(worldPos - uPrevPos);
+                if (abs(expected - histSample.a) > 0.08 * expected + 1.5) blend = max(blend, 0.4);
             }
 
-            vec3 hist = clamp(texture(uHistory, prevUv).rgb, lo, hi);
-            result = mix(hist, cur, clamp(uBlend, 0.0, 1.0));
+            result = mix(hist, cur, blend);
         }
     }
 
-    FragColor = vec4(result, 1.0);
+    // Carry the scene depth so next frame can do the disocclusion test above.
+    FragColor = vec4(result, scene.a);
 }
