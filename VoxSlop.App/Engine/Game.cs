@@ -29,6 +29,8 @@ public sealed class Game : IDisposable
     private RaymarchRenderer _renderer = null!;
     private PlayerController _player = null!;
 
+    private Vector3 _playerStartingPosition;
+
     private Vector2 _lookDelta;
     private Vector2? _lastMousePosition;
     private bool _mouseCaptured;
@@ -108,7 +110,6 @@ public sealed class Game : IDisposable
         _renderer = new RaymarchRenderer(_gl, _world, shaderDir);
         _player = new PlayerController(_world, PlayerController.FindSpawn(_world));
         BuildDynamicShapes();
-        _player.DynamicShapes = _shapes;
 
         _input = _window.CreateInput();
         _keyboard = _input.Keyboards[0];
@@ -134,6 +135,8 @@ public sealed class Game : IDisposable
         _shapes.Add(DynamicShape.Box(near(-7f, 3f, 3f), new Vector3(4f, 0.75f, 1.5f),                       // 8 x 1.5 x 3 m slab
                                      new Vector3(0.03f, 0.11f, 0.06f), concrete));
         _shapes.Add(DynamicShape.Sphere(near(0f, 3.5f, -6f), 1.4f, new Vector3(0.09f, 0.09f, 0.09f), rust));
+
+        _playerStartingPosition = _player.FeetPosition;
     }
 
     private static void PrintControls()
@@ -208,13 +211,11 @@ public sealed class Game : IDisposable
         if (_mouseCaptured && _lookDelta != Vector2.Zero) _player.Look(_lookDelta);
         _lookDelta = Vector2.Zero;
 
-        // Advance shapes before the player moves, so collision tests their current pose.
-        UpdateShapes(deltaSeconds);
-
         if (_mouseCaptured) _player.Update(_keyboard, (float)deltaSeconds);
 
         UpdateSun(deltaSeconds);
         UpdatePointLight(deltaSeconds);
+        UpdateShapes(deltaSeconds);
         UpdateTitle(deltaSeconds);
     }
 
@@ -233,7 +234,7 @@ public sealed class Game : IDisposable
         if (MathF.Floor(_pointAngle / MathF.Tau) != MathF.Floor(previous / MathF.Tau))
             _pointColorIndex = (_pointColorIndex + 1) % PointColors.Length;
 
-        var centre = _player.FeetPosition + new Vector3(0f, PointOrbitHeight, 0f);
+        var centre = _playerStartingPosition + new Vector3(0f, PointOrbitHeight, 0f);
         _renderer.PointLightPosition = centre + new Vector3(
             MathF.Cos(_pointAngle) * PointOrbitRadius, 0f, MathF.Sin(_pointAngle) * PointOrbitRadius);
         _renderer.PointLightColor = PointColors[_pointColorIndex];

@@ -484,17 +484,23 @@ bool traceOneShape(int i, vec3 ro, vec3 rd, float tMax, out float outT, out vec3
     vec3 lo, hi;
     dynShapeAabb(i, lo, hi);
 
-    float tEnter; vec3 enterN;
-    if (!rayBox(ro, rd, lo, hi, tEnter, enterN)) return false;
-    if (tEnter > tMax) return false;
-
+    // Ray/AABB interval. Note: we must start the march at the ENTRY (tN), clamped
+    // to 0 when the origin is already inside the box. Using rayBox here would hand
+    // back the far exit for an inside origin, so the DDA would start past the body
+    // and miss it -- the cause of clipped shadows on rotated shapes.
     vec3 inv = 1.0 / rd;
-    vec3 a = (lo - ro) * inv;
-    vec3 b = (hi - ro) * inv;
-    vec3 tmax3 = max(a, b);
-    float tStop = min(tMax, min(min(tmax3.x, tmax3.y), tmax3.z));
+    vec3 tlo = (lo - ro) * inv;
+    vec3 thi = (hi - ro) * inv;
+    vec3 tmin3 = min(tlo, thi);
+    vec3 tmax3 = max(tlo, thi);
+    float tN = max(max(tmin3.x, tmin3.y), tmin3.z);
+    float tF = min(min(tmax3.x, tmax3.y), tmax3.z);
+    if (tF < max(tN, 0.0)) return false;   // ray misses the box
+    if (tN > tMax) return false;
 
-    float t = max(tEnter, 0.0) + 1e-3;
+    float tStop = min(tMax, tF);
+
+    float t = max(tN, 0.0) + 1e-3;
     vec3  sgn = sign(rd);
     ivec3 istep = ivec3(sgn);
     vec3  tDelta = abs(inv);
@@ -506,7 +512,11 @@ bool traceOneShape(int i, vec3 ro, vec3 rd, float tMax, out float outT, out vec3
         float bound = float(v[k]) + (sgn[k] > 0.0 ? 1.0 : 0.0);
         tNext[k] = (rd[k] == 0.0) ? 1e30 : (bound - ro[k]) * inv[k];
     }
-    vec3 n = enterN;
+
+    // Entry face normal from the slab that produced tN (only meaningful when the
+    // origin is outside; overwritten by the DDA before any interior hit anyway).
+    vec3 n = vec3(lessThanEqual(tmin3.yzx, tmin3.xyz)) * vec3(lessThanEqual(tmin3.zxy, tmin3.xyz));
+    n *= -sgn;
 
     // Cap covers the long axis of the biggest shape (a few hundred voxels).
     for (int k = 0; k < 512; k++)
