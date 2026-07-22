@@ -8,6 +8,8 @@ VoxSlop is a voxel-based 3D FPS tech demo built on **.NET 10** and **Silk.NET** 
 
 Single project: `VoxSlop.App` (see `VoxSlop.slnx`). No test project exists.
 
+**Follow `STYLE.md` for every edit.** It holds the human-maintainability rules (comment discipline, units, naming, the C#/GLSL lockstep table, shader workflow, and a pre-finish checklist). Rules there take precedence over habits.
+
 ## Commands
 
 ```sh
@@ -28,7 +30,7 @@ The world is a sparse voxel store in "brickmap" form (`VoxelWorld`):
 - `MipPool[]` — a 4³ downsample (`MipUintsPerBrick` = 16 uints) of each stored brick, same slot indexing as `Pool`. **Derived** from the pool by `VoxelWorld.BuildMips`, called after both generation and cache load — it is *not* serialized. Used for distance LOD.
 - Index entry encoding: `0` = empty (`EntryEmpty`), high bit set (`UniformFlag`) = whole brick is the material in the low byte, otherwise the value is `poolSlot + 1`. Empty and uniform bricks cost **no** pool storage.
 
-**The single most important invariant:** `Index[]`, `Pool[]`, `MipPool[]` are uploaded verbatim as SSBOs and decoded by `raymarch.frag`. **The C# memory layout and the GLSL decoding must stay in lockstep** — same brick edge (8), same `128u`/`16u` strides, same entry encoding, same index formula `x + dimX*(y + dimY*z)`. Change one side and you must change the other.
+**The single most important invariant:** `Index[]`, `Pool[]`, `MipPool[]` are uploaded verbatim as SSBOs and decoded by `raymarch.frag`. **The C# memory layout and the GLSL decoding must stay in lockstep** — same brick edge, same strides (GLSL `POOL_STRIDE`/`MIP_STRIDE` = C# `UintsPerBrick`/`MipUintsPerBrick`), same entry encoding, same index formula `x + dimX*(y + dimY*z)`. Change one side and you must change the other — the full pair table is in `STYLE.md` §4.
 
 **Fixed SSBO bindings:** `0` = brick index, `1` = voxel pool, `2` = shadow cache, `3` = dynamic shapes, `4` = mip pool.
 
@@ -71,7 +73,7 @@ Blobs and spheres produce a **smooth** hit normal: it drives diffuse/ambient, bu
 ## Baked vs dynamic shapes
 
 Both re-voxelise onto the **world grid** (world-axis-aligned voxels), keeping rotated shapes blocky.
-- **Baked** (`Shape` in `WorldGen.cs`; `Box`/`OrientedBox`/`Cube`/`Sphere`, optional rotation, `subtractive` flag) are stamped into the brickmap at generation time — static, but get shadows for free as real world voxels (pillars, the walk-through wall).
+- **Baked** (`Shape` in `Voxels/Shape.cs`; `Box`/`OrientedBox`/`Cube`/`Sphere`, optional rotation, `subtractive` flag) are stamped into the brickmap at generation time — static, but get shadows for free as real world voxels (pillars, the walk-through wall).
 - **Dynamic** (`DynamicShape` in `Engine/`, binding 3, `traceShapes`/`traceOneShape`) render live each frame so they can spin. They depth-composite with the world and **cast/receive/self-shadow** (shadow rays also test `shapesOcclude`). To keep the world-only sun cache valid, terrain sun shadow is `faceShadow(world, cached) × shapeSunFactor(shapes, uncached)`. **No player collision** currently (removed; to be redone).
 - `traceOneShape` computes the ray/AABB entry itself and starts the DDA at `max(tN, 0)` — do **not** substitute `rayBox` there (it returns the far exit for an inside origin, making shadow rays miss the shape — a real past bug).
 

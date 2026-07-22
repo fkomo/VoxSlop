@@ -11,15 +11,17 @@ namespace VoxSlop.App.Engine;
 /// <summary>Owns the window, the world and the render loop.</summary>
 public sealed class Game : IDisposable
 {
-    // 256 x 128 x 256 bricks of 8 voxels at 5 cm = 2048 x 1024 x 2048 voxels,
-    // i.e. a ~102 x 51 x 102 m world. The brick index is dense over the whole
-    // volume at 4 bytes/brick (~33 MB here); the surface pool grows with area.
+    // World size per axis = BrickDim * VoxelWorld.BrickEdge voxels, and that times
+    // VoxelWorld.VoxelSize in metres (currently ~102 x 51 x 102 m). Watch VRAM when
+    // growing these: the brick index is dense over the whole volume (4 bytes/brick,
+    // including empty sky), while the surface pool grows with X*Z area. See
+    // CLAUDE.md "Large-world memory limits".
     private const int BrickDimX = 256;
     private const int BrickDimY = 128;
     private const int BrickDimZ = 256;
     private const int Seed = 1337;
 
-    // Scatter single +1 voxels on the surface for a rougher, tuftier grass look.
+    // Scatter sparse 1-2 voxel bumps on the surface for a rougher, tuftier grass look.
     private const bool AddTerrainNoise = true;
 
     private readonly IWindow _window;
@@ -49,7 +51,7 @@ public sealed class Game : IDisposable
     // setting -X, then below the horizon for "night"), tilted slightly so it never
     // passes exactly overhead. Advances even when the cursor is released, and can
     // be paused with P.
-    private const float SunSpeed = 0.05f; // radians per second, ~42 s per full circle
+    private const float SunSpeed = 0.05f; // radians per second (full circle = Tau / SunSpeed seconds)
     private float _sunAngle = 0.6f;       // start mid-morning
     private bool _sunPaused;
 
@@ -60,9 +62,10 @@ public sealed class Game : IDisposable
     private const float ShadowEpochStep = 0.008f; // radians of sun travel per generation
     private float _epochAngle = 0.6f;
 
-    // Point light orbiting the player. It changes to the next palette colour on
-    // every completed revolution.
-    private const float PointOrbitSpeed = 0.5f;  // radians per second, ~5.7 s per orbit
+    // Point light orbiting the player. With more than one entry in PointColors it
+    // advances to the next colour on every completed revolution; currently the
+    // palette is trimmed to a single blue, so the cycling is dormant.
+    private const float PointOrbitSpeed = 0.5f;  // radians per second (one orbit = Tau / PointOrbitSpeed seconds)
     private const float PointOrbitRadius = 2.5f; // metres from the player
     private const float PointOrbitHeight = 1.2f; // metres above the player's feet
     private float _pointAngle;
@@ -70,13 +73,6 @@ public sealed class Game : IDisposable
     private static readonly Vector3[] PointColors =
     [
         new(0.0f, 0.00f, 0.80f), // blue
-        //new(1.0f, 0.25f, 0.20f), // red
-        //new(1.0f, 0.55f, 0.15f), // orange
-        //new(1.0f, 0.95f, 0.30f), // yellow
-        //new(0.30f, 1.0f, 0.35f), // green
-        //new(0.25f, 0.8f, 1.0f),  // cyan
-        //new(0.45f, 0.4f, 1.0f),  // indigo
-        //new(1.0f, 0.4f, 0.95f),  // magenta
     ];
 
     // Live spinning shapes, rendered each frame (not baked into the world).
@@ -344,7 +340,8 @@ public sealed class Game : IDisposable
 
     public void Dispose()
     {
+        // The input context is deliberately not disposed: Silk.NET can throw when
+        // tearing it down during window close, and the process exits right after.
         _renderer?.Dispose();
-        //_input?.Dispose();
     }
 }

@@ -43,8 +43,8 @@ public sealed class RaymarchRenderer : IDisposable
     private Shader _shader;
 
     // --- Temporal anti-aliasing ---
-    private Shader _taaShader = null!;
-    private Shader _presentShader = null!;
+    private Shader _taaShader;
+    private Shader _presentShader;
     private uint _fbo;
     private uint _sceneTex;                 // this frame's raymarch output (rgb + depth)
     private readonly uint[] _historyTex = new uint[2];
@@ -124,7 +124,7 @@ public sealed class RaymarchRenderer : IDisposable
         _gl = gl;
         _world = world;
         _shaderDirectory = shaderDirectory;
-        _shader = LoadShader();
+        _shader = LoadPass("raymarch.frag");
         _taaShader = LoadPass("taa.frag");
         _presentShader = LoadPass("present.frag");
 
@@ -217,9 +217,7 @@ public sealed class RaymarchRenderer : IDisposable
         return buffer;
     }
 
-    private Shader LoadShader() => LoadPass("raymarch.frag");
-
-    // All post passes reuse the fullscreen-triangle vertex shader.
+    // All passes reuse the fullscreen-triangle vertex shader.
     private Shader LoadPass(string frag) => Shader.FromSource(
         _gl,
         File.ReadAllText(Path.Combine(_shaderDirectory, "raymarch.vert")),
@@ -305,55 +303,68 @@ public sealed class RaymarchRenderer : IDisposable
             TextureTarget.Texture2D, _sceneTex, 0);
         DrawScene(camera, width, height, jitter);
 
-        uint presentTex = _sceneTex;
+        // Pass 2 (optional): resolve TAA into the history chain.
+        uint presentTex = TaaEnabled ? ResolveTaa(camera, width, height, jitter) : _sceneTex;
 
-        if (TaaEnabled)
-        {
-            int prev = _historyCur;
-            int cur = 1 - _historyCur;
+        // Final pass: present to the screen.
+        Present(presentTex, width, height);
 
-            // Pass 2: blend into history (reprojected + clamped) -> historyTex[cur].
-            _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
-                TextureTarget.Texture2D, _historyTex[cur], 0);
-            _gl.Viewport(0, 0, (uint)width, (uint)height);
-            _taaShader.Use();
-            BindTexture(0, _sceneTex);
-            BindTexture(1, _historyTex[prev]);
-            _taaShader.Set("uScene", 0);
-            _taaShader.Set("uHistory", 1);
-            _taaShader.Set("uResolution", width, height);
-            _taaShader.Set("uJitter", jitter.X, jitter.Y);
-            _taaShader.Set("uTanHalfFov", camera.TanHalfFov);
-            _taaShader.Set("uCamPos", camera.Position / VoxelWorld.VoxelSize);
-            _taaShader.Set("uCamRight", camera.Right);
-            _taaShader.Set("uCamUp", camera.Up);
-            _taaShader.Set("uCamForward", camera.Forward);
-            _taaShader.Set("uPrevPos", _prevPos);
-            _taaShader.Set("uPrevRight", _prevRight);
-            _taaShader.Set("uPrevUp", _prevUp);
-            _taaShader.Set("uPrevForward", _prevForward);
-            _taaShader.Set("uPrevTanHalfFov", _prevTanHalfFov);
-            _taaShader.Set("uReset", _historyValid ? 0 : 1);
-            _taaShader.Set("uBlend", 0.1f);
-            _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+        StorePrevCamera(camera);
+    }
 
-            presentTex = _historyTex[cur];
-            _historyCur = cur;
-            _historyValid = true;
-        }
+    /// <summary>
+    /// Blends the fresh scene into the reprojected, clamped history and returns the
+    /// texture holding the resolved result. Ping-pongs between the two history textures.
+    /// </summary>
+    private uint ResolveTaa(Camera camera, int width, int height, Vector2 jitter)
+    {
+        int prev = _historyCur;
+        int cur = 1 - _historyCur;
 
-        // Final pass: present to the screen (retro filter + crosshair applied here,
-        // after TAA, so the dither is not averaged away by accumulation).
+        _gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, _historyTex[cur], 0);
+        _gl.Viewport(0, 0, (uint)width, (uint)height);
+        _taaShader.Use();
+        BindTexture(0, _sceneTex);
+        BindTexture(1, _historyTex[prev]);
+        _taaShader.Set("uScene", 0);
+        _taaShader.Set("uHistory", 1);
+        _taaShader.Set("uResolution", width, height);
+        _taaShader.Set("uJitter", jitter.X, jitter.Y);
+        _taaShader.Set("uTanHalfFov", camera.TanHalfFov);
+        _taaShader.Set("uCamPos", camera.Position / VoxelWorld.VoxelSize);
+        _taaShader.Set("uCamRight", camera.Right);
+        _taaShader.Set("uCamUp", camera.Up);
+        _taaShader.Set("uCamForward", camera.Forward);
+        _taaShader.Set("uPrevPos", _prevPos);
+        _taaShader.Set("uPrevRight", _prevRight);
+        _taaShader.Set("uPrevUp", _prevUp);
+        _taaShader.Set("uPrevForward", _prevForward);
+        _taaShader.Set("uPrevTanHalfFov", _prevTanHalfFov);
+        _taaShader.Set("uReset", _historyValid ? 0 : 1);
+        _taaShader.Set("uBlend", 0.1f);
+        _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
+
+        _historyCur = cur;
+        _historyValid = true;
+        return _historyTex[cur];
+    }
+
+    /// <summary>
+    /// Draws the given texture to the screen. The retro filter and crosshair live in
+    /// this pass, after TAA, so accumulation can neither average the dither away nor
+    /// smear the crosshair.
+    /// </summary>
+    private void Present(uint sourceTex, int width, int height)
+    {
         _gl.BindFramebuffer(FramebufferTarget.Framebuffer, 0);
         _gl.Viewport(0, 0, (uint)width, (uint)height);
         _presentShader.Use();
-        BindTexture(0, presentTex);
+        BindTexture(0, sourceTex);
         _presentShader.Set("uImage", 0);
         _presentShader.Set("uResolution", width, height);
         _presentShader.Set("uRetro", RetroPalette ? 1 : 0);
         _gl.DrawArrays(PrimitiveType.Triangles, 0, 3);
-
-        StorePrevCamera(camera);
     }
 
     // Sets all scene uniforms and draws the raymarch pass into the current framebuffer.

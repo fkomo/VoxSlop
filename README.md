@@ -63,4 +63,5 @@ dotnet run --project VoxSlop.App
 
 Built on [.NET 10](https://dotnet.microsoft.com/) and
 [Silk.NET](https://github.com/dotnet/Silk.NET) (windowing, input, OpenGL).
-See [CLAUDE.md](CLAUDE.md) for architecture notes.
+See [CLAUDE.md](CLAUDE.md) for architecture notes and [STYLE.md](STYLE.md) for
+the code-maintainability rules to follow when contributing.

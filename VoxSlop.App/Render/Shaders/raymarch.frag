@@ -4,7 +4,19 @@
 // Cost scales with resolution, not with voxel count -- which is the whole reason
 // a billion-voxel world is tractable here.
 //
-// Buffer layout must match Voxels/VoxelWorld.cs.
+// Buffer layout must match Voxels/VoxelWorld.cs (see the "storage access" section).
+//
+// Map of this file, top to bottom:
+//   buffers + uniforms + constants
+//   storage access        - brickAt / voxelAt / mipAt / materialAt
+//   procedural colour     - hashCell / valueNoise / grassColor / surfaceColor / detailAt
+//   world tracing         - intersectGrid / trace (the two-level DDA) / skyColor
+//   sun + shadow cache    - voxelFaceLight / faceKey / faceShadow
+//   point light           - pointFaceVisible / pointLight
+//   dynamic shapes        - rayBox / traceOneShape / traceShapes / shapesOcclude / shapeSunFactor
+//   ambient occlusion     - cornerAO / faceAO
+//   voxel restyling       - densityAt / blobNormal / blobRefine (blobs), snapAxis
+//   main
 
 out vec4 FragColor;
 
@@ -56,13 +68,33 @@ uniform vec3  uPointPos;        // position in VOXEL units
 uniform vec3  uPointColor;      // linear RGB
 uniform float uPointStrength;   // intensity; also gates whether a surface is lit at all
 
-const int   B            = 8;          // voxels per brick edge
-const uint  UNIFORM_FLAG = 0x80000000u;
-const float FOG_DENSITY  = 0.00004;    // per voxel of distance; light enough to see far terrain
-const float SHADOW_RANGE = 2500.0;     // voxels; long enough for terrain to shade itself
+// Storage layout -- every value here mirrors a constant in Voxels/VoxelWorld.cs
+// and must change with it (see STYLE.md "C#/GLSL lockstep").
+const int   BRICK_EDGE       = 8;           // voxels per brick edge          = VoxelWorld.BrickEdge
+const int   MIP_EDGE         = 4;           // mip cells per brick edge       = VoxelWorld.MipEdge
+const uint  POOL_STRIDE      = 128u;        // uints per pool brick           = VoxelWorld.UintsPerBrick
+const uint  MIP_STRIDE       = 16u;         // uints per mip brick            = VoxelWorld.MipUintsPerBrick
+const uint  UNIFORM_FLAG     = 0x80000000u; // "whole brick is one material"  = VoxelWorld.UniformFlag
+
+// Material ids -- mirror the Materials class in Voxels/Materials.cs.
+const uint  MAT_GRASS        = 1u;
+const uint  MAT_DIRT         = 2u;
+const uint  MAT_STONE        = 3u;
+const uint  MAT_CONCRETE     = 4u;
+const uint  MAT_RUST         = 5u;
+const uint  MAT_GRASS_TUFT   = 6u;
+
+// Tuning constants. Distances are in voxels, so retune the per-distance ones
+// when VoxelWorld.VoxelSize changes to keep the physical look the same.
+const float FOG_DENSITY   = 0.00004;   // per voxel of distance; light enough to see far terrain
+const float SHADOW_RANGE  = 2500.0;    // voxels; long enough for terrain to shade itself
 const float POINT_FALLOFF = 0.0030;    // inverse-square attenuation scale (per voxel^2)
 const float POINT_MIN     = 0.03;      // below this, a surface receives no meaningful light
-const float SPHERE_R      = 0.7;      // sphere-voxel radius; >0.71 fully merges, <0.5 gaps
+const float SPHERE_R      = 0.7;       // sphere-voxel radius; >0.71 fully merges, <0.5 gaps
+
+// --- Storage access ----------------------------------------------------------
+// Materials are one byte, packed 4-per-uint; decode order matches the C# packing
+// in VoxelWorld.WritePoolVoxel.
 
 uint brickAt(ivec3 bc)
 {
@@ -71,24 +103,22 @@ uint brickAt(ivec3 bc)
 
 uint voxelAt(uint slot, ivec3 lv)
 {
-    uint li = uint(lv.x + B * (lv.y + B * lv.z));   // 0..511
-    uint word = voxels[slot * 128u + (li >> 2)];
+    uint li = uint(lv.x + BRICK_EDGE * (lv.y + BRICK_EDGE * lv.z));
+    uint word = voxels[slot * POOL_STRIDE + (li >> 2)];
     return (word >> ((li & 3u) * 8u)) & 0xFFu;
 }
 
-const int MB = 4;   // mip cells per brick edge (each cell = 2 voxels)
-
 uint mipAt(uint slot, ivec3 mc)
 {
-    uint li = uint(mc.x + MB * (mc.y + MB * mc.z));  // 0..63
-    uint word = mipVoxels[slot * 16u + (li >> 2)];
+    uint li = uint(mc.x + MIP_EDGE * (mc.y + MIP_EDGE * mc.z));
+    uint word = mipVoxels[slot * MIP_STRIDE + (li >> 2)];
     return (word >> ((li & 3u) * 8u)) & 0xFFu;
 }
 
 // Direct material query for a world voxel (index -> pool). 0 = air / out of bounds.
 uint materialAt(ivec3 v)
 {
-    if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, uBrickDims * B))) return 0u;
+    if (any(lessThan(v, ivec3(0))) || any(greaterThanEqual(v, uBrickDims * BRICK_EDGE))) return 0u;
     uint entry = brickAt(v >> 3);
     if (entry == 0u) return 0u;
     if ((entry & UNIFORM_FLAG) != 0u) return entry & 0xFFu;
@@ -96,6 +126,8 @@ uint materialAt(ivec3 v)
 }
 
 bool solidAt(ivec3 v) { return materialAt(v) != 0u; }
+
+// --- Procedural colour -------------------------------------------------------
 
 // Hash of an integer voxel cell, in [0,1]. Everything procedural here builds on it.
 float hashCell(ivec3 v)
@@ -159,15 +191,15 @@ vec3 grassColor(ivec3 v, float detail)
 
 vec3 surfaceColor(uint m, ivec3 v, float detail)
 {
-    if (m == 1u) return grassColor(v, detail) * 0.68;   // ground grass, darker
-    if (m == 6u) return grassColor(v, detail) * 1.30;   // raised tufts, lighter
+    if (m == MAT_GRASS)      return grassColor(v, detail) * 0.68;   // ground grass, darker
+    if (m == MAT_GRASS_TUFT) return grassColor(v, detail) * 1.30;   // raised tufts, lighter
 
     vec3 base;
-    if      (m == 2u) base = vec3(0.42, 0.30, 0.18);   // dirt
-    else if (m == 3u) base = vec3(0.44, 0.44, 0.47);   // stone
-    else if (m == 4u) base = vec3(0.70, 0.68, 0.64);   // concrete
-    else if (m == 5u) base = vec3(0.83, 0.42, 0.14);   // rust
-    else              base = vec3(1.0, 0.0, 1.0);      // unknown material
+    if      (m == MAT_DIRT)     base = vec3(0.42, 0.30, 0.18);
+    else if (m == MAT_STONE)    base = vec3(0.44, 0.44, 0.47);
+    else if (m == MAT_CONCRETE) base = vec3(0.70, 0.68, 0.64);
+    else if (m == MAT_RUST)     base = vec3(0.83, 0.42, 0.14);
+    else                        base = vec3(1.0, 0.0, 1.0);   // magenta = unknown material
 
     // Mild grain up close, faded out where voxels go sub-pixel.
     return base * mix(1.0, 0.90 + 0.20 * hashCell(v), detail);
@@ -180,6 +212,8 @@ float detailAt(float dist)
     float subpixel = uResolution.y / (2.0 * uTanHalfFov); // distance where a voxel ~= 1 px
     return 1.0 - smoothstep(subpixel, subpixel * 4.0, dist);
 }
+
+// --- World tracing (two-level DDA) -------------------------------------------
 
 bool intersectGrid(vec3 ro, vec3 rd, vec3 bmax, out float t0, out float t1, out vec3 entryNormal)
 {
@@ -210,7 +244,7 @@ struct Hit
 // Marches bricks, and descends into voxels only for bricks that hold a surface.
 bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
 {
-    vec3 gridMax = vec3(uBrickDims * B);
+    vec3 gridMax = vec3(uBrickDims * BRICK_EDGE);
 
     float t0, t1;
     vec3 normal;
@@ -225,13 +259,13 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
 
     // Brick-level DDA. All t values stay in voxel units so the inner loop can
     // share them without rescaling.
-    ivec3 bc = clamp(ivec3(floor((ro + rd * t) / float(B))), ivec3(0), uBrickDims - 1);
-    vec3 deltaBrick = abs(float(B) / rd);
+    ivec3 bc = clamp(ivec3(floor((ro + rd * t) / float(BRICK_EDGE))), ivec3(0), uBrickDims - 1);
+    vec3 deltaBrick = abs(float(BRICK_EDGE) / rd);
     vec3 nextBrick;
     for (int i = 0; i < 3; i++)
     {
         float bound = float(bc[i]) + (sgn[i] > 0.0 ? 1.0 : 0.0);
-        nextBrick[i] = (rd[i] == 0.0) ? 1e30 : (bound * float(B) - ro[i]) / rd[i];
+        nextBrick[i] = (rd[i] == 0.0) ? 1e30 : (bound * float(BRICK_EDGE) - ro[i]) / rd[i];
     }
 
     vec3 deltaVoxel = abs(1.0 / rd);
@@ -245,7 +279,8 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
     // pattern; near and far look nearly identical in the band so the stipple is faint.
     float mipDither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
 
-    for (int step = 0; step < uMaxBrickSteps; step++)
+    // Note: do not name a variable "step" -- it shadows the GLSL built-in step().
+    for (int brickStep = 0; brickStep < uMaxBrickSteps; brickStep++)
     {
         uint entry = brickAt(bc);
 
@@ -260,17 +295,18 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                 return true;
             }
 
-            // Partial brick. Near: full 8^3 DDA. Far: the 4^3 mip (cell = 2 voxels)
-            // so sub-pixel voxels resolve to stable 4 cm cells instead of shimmering.
+            // Partial brick. Near: full fine-voxel DDA. Far: the mip (cell = 2
+            // voxels) so sub-pixel voxels resolve to stable, larger cells instead
+            // of shimmering.
             uint slot = entry - 1u;
-            vec3  base = vec3(bc * B);
+            vec3  base = vec3(bc * BRICK_EDGE);
             vec3  p    = ro + rd * (t + 1e-3);
 
             // Probability of using the mip ramps from 0 to 1 across the transition band.
             float lodFrac = smoothstep(mipDist * 0.7, mipDist * 1.9, t);
             if (mipDither < lodFrac)
             {
-                ivec3 mc = clamp(ivec3(floor((p - base) * 0.5)), ivec3(0), ivec3(MB - 1));
+                ivec3 mc = clamp(ivec3(floor((p - base) * 0.5)), ivec3(0), ivec3(MIP_EDGE - 1));
 
                 vec3 nextCell;
                 for (int i = 0; i < 3; i++)
@@ -282,7 +318,7 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                 float tv = t;
                 vec3  nv = normal;
 
-                for (int k = 0; k < 3 * MB; k++)
+                for (int k = 0; k < 3 * MIP_EDGE; k++)
                 {
                     uint m = mipAt(slot, mc);
                     if (m != 0u)
@@ -290,7 +326,7 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                         hit.t = tv;
                         hit.normal = nv;
                         hit.material = m;
-                        hit.voxel = bc * B + mc * 2;
+                        hit.voxel = bc * BRICK_EDGE + mc * 2;
                         return true;
                     }
 
@@ -298,19 +334,19 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                     {
                         tv = nextCell.x; nextCell.x += deltaCell.x;
                         mc.x += istep.x;  nv = vec3(-sgn.x, 0.0, 0.0);
-                        if (mc.x < 0 || mc.x >= MB) break;
+                        if (mc.x < 0 || mc.x >= MIP_EDGE) break;
                     }
                     else if (nextCell.y < nextCell.z)
                     {
                         tv = nextCell.y; nextCell.y += deltaCell.y;
                         mc.y += istep.y;  nv = vec3(0.0, -sgn.y, 0.0);
-                        if (mc.y < 0 || mc.y >= MB) break;
+                        if (mc.y < 0 || mc.y >= MIP_EDGE) break;
                     }
                     else
                     {
                         tv = nextCell.z; nextCell.z += deltaCell.z;
                         mc.z += istep.z;  nv = vec3(0.0, 0.0, -sgn.z);
-                        if (mc.z < 0 || mc.z >= MB) break;
+                        if (mc.z < 0 || mc.z >= MIP_EDGE) break;
                     }
 
                     if (tv > t1) return false;
@@ -318,7 +354,7 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
             }
             else
             {
-                ivec3 lv = clamp(ivec3(floor(p - base)), ivec3(0), ivec3(B - 1));
+                ivec3 lv = clamp(ivec3(floor(p - base)), ivec3(0), ivec3(BRICK_EDGE - 1));
 
                 vec3 nextVoxel;
                 for (int i = 0; i < 3; i++)
@@ -330,8 +366,8 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                 float tv = t;
                 vec3  nv = normal;
 
-                // A ray can cross at most 3*(B-1)+1 voxels of one brick.
-                for (int k = 0; k < 3 * B; k++)
+                // A ray can cross at most 3*(BRICK_EDGE-1)+1 voxels of one brick.
+                for (int k = 0; k < 3 * BRICK_EDGE; k++)
                 {
                     uint m = voxelAt(slot, lv);
                     if (m != 0u)
@@ -341,13 +377,13 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                             hit.t = tv;
                             hit.normal = nv;
                             hit.material = m;
-                            hit.voxel = bc * B + lv;
+                            hit.voxel = bc * BRICK_EDGE + lv;
                             return true;
                         }
 
                         // Bead voxel: intersect this voxel's sphere. On a miss, keep
                         // marching so gaps between beads reveal what is behind.
-                        vec3 centre = vec3(bc * B + lv) + 0.5;
+                        vec3 centre = vec3(bc * BRICK_EDGE + lv) + 0.5;
                         vec3 oc = ro - centre;
                         float bb = dot(oc, rd);
                         float disc = bb * bb - (dot(oc, oc) - SPHERE_R * SPHERE_R);
@@ -359,7 +395,7 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                                 hit.t = th;
                                 hit.normal = normalize(ro + rd * th - centre);
                                 hit.material = m;
-                                hit.voxel = bc * B + lv;
+                                hit.voxel = bc * BRICK_EDGE + lv;
                                 return true;
                             }
                         }
@@ -370,19 +406,19 @@ bool trace(vec3 ro, vec3 rd, float tMax, out Hit hit)
                     {
                         tv = nextVoxel.x; nextVoxel.x += deltaVoxel.x;
                         lv.x += istep.x;  nv = vec3(-sgn.x, 0.0, 0.0);
-                        if (lv.x < 0 || lv.x >= B) break;
+                        if (lv.x < 0 || lv.x >= BRICK_EDGE) break;
                     }
                     else if (nextVoxel.y < nextVoxel.z)
                     {
                         tv = nextVoxel.y; nextVoxel.y += deltaVoxel.y;
                         lv.y += istep.y;  nv = vec3(0.0, -sgn.y, 0.0);
-                        if (lv.y < 0 || lv.y >= B) break;
+                        if (lv.y < 0 || lv.y >= BRICK_EDGE) break;
                     }
                     else
                     {
                         tv = nextVoxel.z; nextVoxel.z += deltaVoxel.z;
                         lv.z += istep.z;  nv = vec3(0.0, 0.0, -sgn.z);
-                        if (lv.z < 0 || lv.z >= B) break;
+                        if (lv.z < 0 || lv.z >= BRICK_EDGE) break;
                     }
 
                     if (tv > t1) return false;
@@ -424,6 +460,8 @@ vec3 skyColor(vec3 rd)
     return sky + vec3(1.0, 0.92, 0.75) * sun;
 }
 
+// --- Sun shadow + per-face shadow cache --------------------------------------
+
 // Fraction of the lit voxel FACE that can see the sun, returned as a light factor
 // in [0,1]. The sample points are derived from the voxel coordinate and its face
 // normal -- NOT from the per-pixel hit point -- so every pixel covering the face
@@ -462,12 +500,14 @@ float voxelFaceLight(ivec3 voxel, vec3 n)
     return lit * (inv * inv);
 }
 
-// Packs a voxel face into a 64-bit key. Voxel coords reach ~8192 (13 bits) in X/Z
-// and a few hundred (10 bits) in Y; the face index is 0..5 (3 bits).
+// Packs a voxel face into a 64-bit key: 13 bits each for X and Z (grids up to
+// 8192 voxels across), 12 bits for Y (up to 4096), 3 bits for the face index
+// (0..5). If the grid ever outgrows these widths, keys alias and the shadow
+// cache returns light values from the wrong faces.
 uvec2 faceKey(ivec3 voxel, int faceIndex)
 {
-    uint lo = uint(voxel.x) | (uint(voxel.z) << 13);            // 13 + 13 bits
-    uint hi = uint(voxel.y) | (uint(faceIndex) << 12);          // 12 + 3 bits
+    uint lo = uint(voxel.x) | (uint(voxel.z) << 13);
+    uint hi = uint(voxel.y) | (uint(faceIndex) << 12);
     return uvec2(lo, hi);
 }
 
@@ -505,6 +545,8 @@ float faceShadow(ivec3 voxel, vec3 n)
     shadowCache[slot] = uvec4(key.x, key.y, uShadowEpoch, floatBitsToUint(light));
     return light;
 }
+
+// --- Point light -------------------------------------------------------------
 
 // Fraction of a voxel face that can see a point light at lightPos (voxel units).
 // Same face-quantised sampling as the sun, but each ray is cast toward the light
@@ -562,6 +604,8 @@ vec3 pointLight(ivec3 voxel, vec3 n)
 
     return uPointColor * contrib * pointFaceVisible(voxel, n, uPointPos);
 }
+
+// --- Dynamic (live) shapes ---------------------------------------------------
 
 // Nearest intersection of a unit-direction ray with an axis-aligned box, plus the
 // entry face normal. Returns false on a miss or if the box is fully behind ro.
@@ -648,8 +692,9 @@ bool traceOneShape(int i, vec3 ro, vec3 rd, float tMax, out float outT, out vec3
     vec3 n = vec3(lessThanEqual(tmin3.yzx, tmin3.xyz)) * vec3(lessThanEqual(tmin3.zxy, tmin3.xyz));
     n *= -sgn;
 
-    // Cap covers the long axis of the biggest shape in voxels; at 2 cm the 8 m beam
-    // spans ~400 voxels and its rotated AABB corridor is longer still.
+    // March cap, in voxels. It must exceed the longest corridor a ray can walk
+    // through any live shape's rotated AABB -- grow it if VoxelSize shrinks or a
+    // bigger shape is added (see CLAUDE.md "When changing key constants").
     for (int k = 0; k < 2048; k++)
     {
         if (t > tStop) return false;
@@ -727,6 +772,8 @@ float shapeSunFactor(ivec3 voxel, vec3 n)
     return lit * (inv * inv);
 }
 
+// --- Ambient occlusion -------------------------------------------------------
+
 // Classic voxel corner occlusion: at a face corner, count the two edge neighbours
 // and the diagonal neighbour in the air cell just off the face. Two solid edges
 // fully occlude the corner.
@@ -761,7 +808,7 @@ float faceAO(ivec3 hv, vec3 n, vec3 hitP)
     return mix(mix(a00, a10, fu), mix(a01, a11, fu), fv);
 }
 
-// --- Rounded-blob voxels -----------------------------------------------------
+// --- Voxel restyling (rounded blobs) -----------------------------------------
 // A trilinear occupancy field over the voxel grid; its 0.5 isosurface is a
 // smoothed, rounded version of the blocky geometry.
 float densityAt(vec3 p)
@@ -839,6 +886,8 @@ vec3 snapAxis(vec3 n)
     if (a.y >= a.z)               return vec3(0.0, sign(n.y), 0.0);
     return vec3(0.0, 0.0, sign(n.z));
 }
+
+// --- Main --------------------------------------------------------------------
 
 void main()
 {

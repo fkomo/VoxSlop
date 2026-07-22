@@ -1,31 +1,26 @@
 using System.Diagnostics;
-using System.Numerics;
 using System.Threading;
 
 namespace VoxSlop.App.Voxels;
 
-public static class Materials
-{
-    public const byte Air = 0;
-    public const byte Grass = 1;
-    public const byte Dirt = 2;
-    public const byte Stone = 3;
-    public const byte Concrete = 4;
-    public const byte Rust = 5;
-    public const byte GrassTuft = 6; // the raised voxel tufts, coloured lighter than the ground
-}
-
 /// <summary>
 /// Builds the demo scene: an fBm heightfield plus a handful of hand-placed
-/// solids. Generation is a three-pass affair — classify every brick, prefix-sum
-/// the ones needing storage, then fill only those — because sampling all
-/// ~2 billion voxel slots directly would take minutes.
+/// solids. Generation reasons at brick granularity because sampling billions of
+/// individual voxel slots would take minutes — see the pass methods called from
+/// <see cref="Generate"/>: ClassifyBricks, AssignPoolSlots, FillPartialBricks,
+/// CompactPool.
 /// </summary>
 public static class WorldGen
 {
-    // Depth below the surface, in voxels, at which each material takes over.
-    private const int GrassDepth = 2;   // 2 cm of grass
-    private const int DirtDepth = 10;   // then 8 cm of dirt, stone below
+    // Depth below the surface, in voxels, at which each material takes over:
+    // grass down to GrassDepth, dirt down to DirtDepth, stone below that.
+    private const int GrassDepth = 2;
+    private const int DirtDepth = 10;
+
+    // Brick classification results, used between the classify and slot-assign passes.
+    private const byte BrickEmpty = 0;
+    private const byte BrickUniform = 1;
+    private const byte BrickPartial = 2;
 
     public static VoxelWorld Generate(int brickDimX, int brickDimY, int brickDimZ, int seed,
                                       bool addTerrainNoise)
@@ -37,64 +32,104 @@ public static class WorldGen
         int[] height = BuildHeightmap(world, seed, addTerrainNoise, out byte[] tuft);
         Shape[] shapes = BuildShapes(world, height, seed);
 
-        // Pass 1 — classify each brick without touching individual voxels where possible.
-        int brickCount = world.Index.Length;
-        var kind = new byte[brickCount];      // 0 = empty, 1 = uniform, 2 = partial
-        var uniformMat = new byte[brickCount];
+        ClassifyBricks(world, height, shapes, out byte[] kind, out byte[] uniformMat);
+        int[] partialBricks = AssignPoolSlots(world, kind, uniformMat);
+        FillPartialBricks(world, partialBricks, height, tuft, shapes);
+        int kept = CompactPool(world, partialBricks);
+        world.BuildMips(); // LOD payloads, derived from the compacted pool
 
-        int classified = 0, classifyStep = Math.Max(1, brickDimZ / 100);
-        Parallel.For(0, brickDimZ, bz =>
+        PrintSummary(world, partialBricks.Length, kept, sw);
+        return world;
+    }
+
+    /// <summary>
+    /// Pass 1 — classify each brick as empty / uniform / partial from the heightfield
+    /// and shape AABBs alone, without touching individual voxels. Classification is
+    /// deliberately conservative: anything it cannot prove empty or uniform is marked
+    /// partial and resolved properly by the fill + compact passes.
+    /// </summary>
+    private static void ClassifyBricks(VoxelWorld world, int[] height, Shape[] shapes,
+                                       out byte[] kind, out byte[] uniformMat)
+    {
+        int brickCount = world.Index.Length;
+        var kindLocal = new byte[brickCount];
+        var uniformLocal = new byte[brickCount];
+
+        int classified = 0, progressStep = Math.Max(1, world.BrickDimZ / 100);
+        Parallel.For(0, world.BrickDimZ, bz =>
         {
-            for (int by = 0; by < brickDimY; by++)
-            for (int bx = 0; bx < brickDimX; bx++)
+            for (int by = 0; by < world.BrickDimY; by++)
+            for (int bx = 0; bx < world.BrickDimX; bx++)
             {
                 int bi = world.BrickIndexOf(bx, by, bz);
                 int y0 = by * VoxelWorld.BrickEdge;
 
                 if (OverlapsAnyShape(shapes, bx, by, bz))
                 {
-                    kind[bi] = 2; // must sample properly
+                    kindLocal[bi] = BrickPartial; // must sample properly
                     continue;
                 }
 
                 ColumnRange(height, world.VoxelDimX, bx, bz, out int minH, out int maxH);
 
                 if (y0 >= maxH)
-                    kind[bi] = 0;                       // entirely above the terrain
+                    kindLocal[bi] = BrickEmpty;   // entirely above the terrain
                 else if (y0 + VoxelWorld.BrickEdge - 1 <= minH - 1 - DirtDepth)
-                    (kind[bi], uniformMat[bi]) = ((byte)1, Materials.Stone);
+                    (kindLocal[bi], uniformLocal[bi]) = (BrickUniform, Materials.Stone);
                 else
-                    kind[bi] = 2;                       // straddles the surface or a material band
+                    kindLocal[bi] = BrickPartial; // straddles the surface or a material band
             }
 
             int d = Interlocked.Increment(ref classified);
-            if (d % classifyStep == 0 || d == brickDimZ) PrintProgress("Classifying bricks", d, brickDimZ);
+            if (d % progressStep == 0 || d == world.BrickDimZ)
+                PrintProgress("Classifying bricks", d, world.BrickDimZ);
         });
         FinishProgress();
 
-        // Pass 2 — assign pool slots. Serial, but it is a single linear scan.
+        kind = kindLocal;
+        uniformMat = uniformLocal;
+    }
+
+    /// <summary>
+    /// Pass 2 — write the index entry for every brick and hand each partial brick a
+    /// pool slot. Serial, but it is a single linear scan. Returns the partial bricks
+    /// in slot order (slot i holds brick partialBricks[i]).
+    /// </summary>
+    private static int[] AssignPoolSlots(VoxelWorld world, byte[] kind, byte[] uniformMat)
+    {
         int allocated = 0;
-        for (int bi = 0; bi < brickCount; bi++)
-            if (kind[bi] == 2) allocated++;
+        for (int bi = 0; bi < kind.Length; bi++)
+            if (kind[bi] == BrickPartial) allocated++;
 
         world.AllocatePool(allocated);
         var partialBricks = new int[allocated];
         int next = 0;
-        for (int bi = 0; bi < brickCount; bi++)
+        for (int bi = 0; bi < kind.Length; bi++)
         {
             world.Index[bi] = kind[bi] switch
             {
-                0 => VoxelWorld.EntryEmpty,
-                1 => VoxelWorld.UniformFlag | uniformMat[bi],
+                BrickEmpty => VoxelWorld.EntryEmpty,
+                BrickUniform => VoxelWorld.UniformFlag | uniformMat[bi],
                 _ => (uint)(next + 1),
             };
-            if (kind[bi] == 2) partialBricks[next++] = bi;
+            if (kind[bi] == BrickPartial) partialBricks[next++] = bi;
         }
 
-        // Pass 3 — fill only the bricks that earned storage.
-        int strideY = brickDimX;
-        int strideZ = brickDimX * brickDimY;
-        int filled = 0, fillStep = Math.Max(1, allocated / 100);
+        return partialBricks;
+    }
+
+    /// <summary>
+    /// Pass 3 — sample and store voxels for the partial bricks only; every other
+    /// brick is already fully described by its index entry.
+    /// </summary>
+    private static void FillPartialBricks(VoxelWorld world, int[] partialBricks,
+                                          int[] height, byte[] tuft, Shape[] shapes)
+    {
+        int strideY = world.BrickDimX;
+        int strideZ = world.BrickDimX * world.BrickDimY;
+        int allocated = partialBricks.Length;
+
+        int filled = 0, progressStep = Math.Max(1, allocated / 100);
         Parallel.For(0, allocated, slot =>
         {
             int bi = partialBricks[slot];
@@ -117,18 +152,15 @@ public static class WorldGen
             }
 
             int d = Interlocked.Increment(ref filled);
-            if (d % fillStep == 0 || d == allocated) PrintProgress("Filling bricks", d, allocated);
+            if (d % progressStep == 0 || d == allocated) PrintProgress("Filling bricks", d, allocated);
         });
         FinishProgress();
+    }
 
-        // Pass 4 — reclaim slots that turned out uniform after all. Classification
-        // is deliberately conservative (it can only reason about the heightfield),
-        // so a large share of the material-band and shape-adjacent bricks end up
-        // holding a single repeated value. On a 40 m map this is worth hundreds of MB.
-        int kept = CompactPool(world, partialBricks);
-        world.BuildMips(); // 4^3 LOD payloads, derived from the compacted pool
-
+    private static void PrintSummary(VoxelWorld world, int allocated, int kept, Stopwatch sw)
+    {
         long totalSlots = (long)world.VoxelDimX * world.VoxelDimY * world.VoxelDimZ;
+        int brickCount = world.Index.Length;
         double indexMb = world.Index.Length * 4.0 / (1024 * 1024);
         double poolMb = world.Pool.Length * 4.0 / (1024 * 1024);
         Console.WriteLine(
@@ -141,14 +173,14 @@ public static class WorldGen
         Console.WriteLine(
             $"GPU memory: {indexMb:0.0} MB index + {poolMb:0.0} MB pool = {indexMb + poolMb:0.0} MB.");
         Console.WriteLine($"Generated in {sw.ElapsedMilliseconds} ms.");
-
-        return world;
     }
 
     /// <summary>
-    /// Rewrites any filled brick whose voxels are all the same value back into an
-    /// inline index entry, then compacts the pool to drop the freed slots.
-    /// Returns the number of bricks still holding real storage.
+    /// Pass 4 — rewrites any filled brick whose voxels are all the same value back
+    /// into an inline index entry, then compacts the pool to drop the freed slots.
+    /// Because classification is conservative, a large share of the material-band
+    /// and shape-adjacent bricks end up uniform, so this reclaims a significant
+    /// fraction of the pool. Returns the number of bricks still holding real storage.
     /// </summary>
     private static int CompactPool(VoxelWorld world, int[] partialBricks)
     {
@@ -255,9 +287,9 @@ public static class WorldGen
         var height = new int[dimX * dimZ];
         var tuftLocal = new byte[dimX * dimZ];
 
-        // Gently rolling ground: terrain spans roughly 0.8 m to 2.4 m inside the
-        // 5.12 m tall world. Large feature size + few octaves keeps the relief
-        // broad and smooth rather than choppy.
+        // Gently rolling ground: the surface sits around BaseHeight voxels and
+        // swings by up to Amplitude voxels. Large feature size + few octaves keeps
+        // the relief broad and smooth rather than choppy.
         const float BaseHeight = 80f;    // voxels
         const float Amplitude = 160f;    // voxels
         const float FeatureSize = 1400f; // voxels per noise cell at the base octave
@@ -265,7 +297,7 @@ public static class WorldGen
         // Short-wavelength wobble added before rounding. It barely changes the
         // overall shape but shifts where each integer step lands, so the contour
         // lines between height levels turn ragged instead of clean and artificial.
-        const float EdgeSize = 22f;      // voxels per noise cell (~1.1 m wobble)
+        const float EdgeSize = 22f;       // voxels per noise cell
         const float EdgeAmplitude = 3.0f; // voxels the step boundary can shift by
 
         // Only this fraction of columns get a tuft at all; the rest stay flat.
@@ -353,145 +385,5 @@ public static class WorldGen
         // DynamicShape), rendered each frame rather than baked here.
 
         return [.. shapes];
-    }
-}
-
-/// <summary>
-/// A solid stamped over the terrain during generation. Coordinates are in voxel
-/// units. Boxes may be oriented (rotated) about their centre; spheres are
-/// rotation-invariant. All shapes carry a conservative world-space AABB so brick
-/// classification can reject non-overlapping bricks without a full inside test.
-/// </summary>
-public readonly struct Shape
-{
-    private readonly bool _isSphere;
-    private readonly Vector3 _center;
-    private readonly Vector3 _axisX, _axisY, _axisZ; // orthonormal box axes in world space
-    private readonly Vector3 _half;                  // box half extents
-    private readonly float _radiusSq;                // sphere
-    private readonly int _minX, _minY, _minZ, _maxX, _maxY, _maxZ; // conservative AABB
-
-    public byte Material { get; }
-    public bool Subtractive { get; }
-
-    private Shape(bool isSphere, Vector3 center, Vector3 axisX, Vector3 axisY, Vector3 axisZ,
-                  Vector3 half, float radiusSq, Vector3 aabbHalf, byte material, bool subtractive)
-    {
-        _isSphere = isSphere;
-        _center = center;
-        _axisX = axisX; _axisY = axisY; _axisZ = axisZ;
-        _half = half; _radiusSq = radiusSq;
-
-        _minX = (int)MathF.Floor(center.X - aabbHalf.X);
-        _minY = (int)MathF.Floor(center.Y - aabbHalf.Y);
-        _minZ = (int)MathF.Floor(center.Z - aabbHalf.Z);
-        _maxX = (int)MathF.Ceiling(center.X + aabbHalf.X);
-        _maxY = (int)MathF.Ceiling(center.Y + aabbHalf.Y);
-        _maxZ = (int)MathF.Ceiling(center.Z + aabbHalf.Z);
-
-        Material = material;
-        Subtractive = subtractive;
-    }
-
-    /// <summary>Axis-aligned box from inclusive voxel bounds (back-compat convenience).</summary>
-    public static Shape Box(int minX, int minY, int minZ, int maxX, int maxY, int maxZ,
-                            byte material, bool subtractive = false)
-    {
-        var center = new Vector3((minX + maxX) * 0.5f, (minY + maxY) * 0.5f, (minZ + maxZ) * 0.5f);
-        var half = new Vector3((maxX - minX) * 0.5f, (maxY - minY) * 0.5f, (maxZ - minZ) * 0.5f);
-        return OrientedBox(center, half, Vector3.Zero, material, subtractive);
-    }
-
-    /// <summary>
-    /// Box centred at <paramref name="center"/> (voxels) with the given half extents,
-    /// rotated by Euler angles (radians, applied X then Y then Z). Pass
-    /// <see cref="Vector3.Zero"/> for an axis-aligned box.
-    /// </summary>
-    public static Shape OrientedBox(Vector3 center, Vector3 half, Vector3 eulerRadians,
-                                    byte material, bool subtractive = false)
-    {
-        Matrix4x4 rot = Matrix4x4.CreateRotationX(eulerRadians.X)
-                      * Matrix4x4.CreateRotationY(eulerRadians.Y)
-                      * Matrix4x4.CreateRotationZ(eulerRadians.Z);
-
-        var ax = Vector3.TransformNormal(Vector3.UnitX, rot);
-        var ay = Vector3.TransformNormal(Vector3.UnitY, rot);
-        var az = Vector3.TransformNormal(Vector3.UnitZ, rot);
-
-        // Extent of the oriented box projected onto each world axis.
-        var aabbHalf = new Vector3(
-            half.X * MathF.Abs(ax.X) + half.Y * MathF.Abs(ay.X) + half.Z * MathF.Abs(az.X),
-            half.X * MathF.Abs(ax.Y) + half.Y * MathF.Abs(ay.Y) + half.Z * MathF.Abs(az.Y),
-            half.X * MathF.Abs(ax.Z) + half.Y * MathF.Abs(ay.Z) + half.Z * MathF.Abs(az.Z));
-
-        return new Shape(false, center, ax, ay, az, half, 0f, aabbHalf, material, subtractive);
-    }
-
-    /// <summary>A rotated cube: an oriented box with equal half extents on every axis.</summary>
-    public static Shape Cube(Vector3 center, float halfSize, Vector3 eulerRadians,
-                             byte material, bool subtractive = false) =>
-        OrientedBox(center, new Vector3(halfSize), eulerRadians, material, subtractive);
-
-    public static Shape Sphere(int cx, int cy, int cz, int radius, byte material, bool subtractive = false)
-    {
-        var center = new Vector3(cx, cy, cz);
-        var aabbHalf = new Vector3(radius);
-        return new Shape(true, center, Vector3.UnitX, Vector3.UnitY, Vector3.UnitZ,
-                         Vector3.Zero, radius * (float)radius, aabbHalf, material, subtractive);
-    }
-
-    public bool Contains(int x, int y, int z)
-    {
-        if (x < _minX || x > _maxX || y < _minY || y > _maxY || z < _minZ || z > _maxZ) return false;
-
-        var d = new Vector3(x, y, z) - _center;
-        if (_isSphere) return d.LengthSquared() <= _radiusSq;
-
-        return MathF.Abs(Vector3.Dot(d, _axisX)) <= _half.X
-            && MathF.Abs(Vector3.Dot(d, _axisY)) <= _half.Y
-            && MathF.Abs(Vector3.Dot(d, _axisZ)) <= _half.Z;
-    }
-
-    /// <summary>Conservative AABB test — used to decide whether a brick needs full sampling.</summary>
-    public bool IntersectsBox(int x0, int y0, int z0, int x1, int y1, int z1) =>
-        x1 >= _minX && x0 <= _maxX && y1 >= _minY && y0 <= _maxY && z1 >= _minZ && z0 <= _maxZ;
-}
-
-/// <summary>Hash-based value noise. No dependencies, deterministic for a given seed.</summary>
-internal static class Noise
-{
-    private static float Hash(int x, int z, int seed)
-    {
-        uint h = (uint)(x * 374761393 + z * 668265263 + seed * 1442695041);
-        h = (h ^ (h >> 13)) * 1274126177u;
-        h ^= h >> 16;
-        return (h & 0xFFFFFF) / (float)0xFFFFFF;
-    }
-
-    private static float ValueNoise(float x, float z, int seed)
-    {
-        int xi = (int)MathF.Floor(x), zi = (int)MathF.Floor(z);
-        float fx = x - xi, fz = z - zi;
-        // Smoothstep the interpolants so octaves don't show grid creases.
-        fx = fx * fx * (3f - 2f * fx);
-        fz = fz * fz * (3f - 2f * fz);
-
-        float a = Hash(xi, zi, seed), b = Hash(xi + 1, zi, seed);
-        float c = Hash(xi, zi + 1, seed), d = Hash(xi + 1, zi + 1, seed);
-        return float.Lerp(float.Lerp(a, b, fx), float.Lerp(c, d, fx), fz);
-    }
-
-    /// <summary>Fractal sum of value noise, returned in roughly [0, 1].</summary>
-    public static float Fbm(float x, float z, int seed, int octaves)
-    {
-        float sum = 0f, amp = 0.5f, norm = 0f, freq = 1f;
-        for (int i = 0; i < octaves; i++)
-        {
-            sum += ValueNoise(x * freq, z * freq, seed + i * 7919) * amp;
-            norm += amp;
-            amp *= 0.5f;
-            freq *= 2f;
-        }
-        return sum / norm;
     }
 }

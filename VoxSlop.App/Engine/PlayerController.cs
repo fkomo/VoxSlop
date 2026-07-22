@@ -23,7 +23,7 @@ public sealed class PlayerController
     private const float JumpSpeed = 7.2f;
     private const float MouseSensitivity = 0.0022f;
 
-    // At 1 cm resolution every slope is a staircase of tiny ledges, so horizontal
+    // At cm-scale voxels every slope is a staircase of tiny ledges, so horizontal
     // motion has to be allowed to climb over them or the player wedges instantly.
     private const float StepHeight = 0.65f;
     private const float StepProbe = 0.02f;

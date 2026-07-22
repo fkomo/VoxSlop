@@ -66,9 +66,11 @@ public sealed class VoxelWorld
         BrickDimX = brickDimX;
         BrickDimY = brickDimY;
         BrickDimZ = brickDimZ;
-        Index = new uint[(long)brickDimX * brickDimY * brickDimZ is var n && n <= int.MaxValue
-            ? (int)n
-            : throw new ArgumentException("Brick grid too large for a single array.")];
+
+        long brickCount = (long)brickDimX * brickDimY * brickDimZ;
+        if (brickCount > int.MaxValue)
+            throw new ArgumentException("Brick grid too large for a single array.");
+        Index = new uint[brickCount];
     }
 
     internal void AllocatePool(int brickCount) => Pool = new uint[(long)brickCount * UintsPerBrick];
